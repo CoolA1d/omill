@@ -43,6 +43,7 @@
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/Passes/DeadStateStoreDSE.h"
 #include "omill/Passes/HashImportAnnotation.h"
 #include "omill/Passes/ResolveLazyImports.h"
 #include "omill/Passes/FoldProgramCounter.h"
@@ -477,6 +478,16 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // keep State alive due late-emitted dispatch shims.
   if (!envDisabled("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE")) {
     MPM.addPass(RewriteLiftedCallsToNativePass());
+  }
+
+  // Eliminate dead stores to volatile State fields at call boundaries.
+  // After inlining, the State alloca is local; volatile fields (RAX, RCX,
+  // RDX, R8-R11, XMM0-5) are clobbered by native calls and dead at return.
+  // Running before SROA makes decomposition more likely to succeed.
+  if (!envDisabled("OMILL_SKIP_ABI_DEAD_STATE_STORE_DSE")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(DeadStateStoreDSEPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
   // SROA only: decompose State alloca to expose SSA values for dispatch

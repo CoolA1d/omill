@@ -58,6 +58,7 @@ add_library(omill STATIC
   Passes/ControlFlowUnflattener.cpp
   Passes/SynthesizeFlags.cpp
   Passes/StackConcretization.cpp
+  Passes/DeadStateStoreDSE.cpp
   Passes/IterativeBlockDiscovery.cpp
   Passes/MergeBlockFunctions.cpp
   BC/BlockLifterAnalysis.cpp

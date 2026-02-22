@@ -86,6 +86,7 @@ add_executable(omill-unit-tests
   unit/SynthesizeFlagsTest.cpp
   unit/SegmentsAATest.cpp
   unit/StackConcretizationTest.cpp
+  unit/DeadStateStoreDSETest.cpp
 )
 
 target_link_libraries(omill-unit-tests
