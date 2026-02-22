@@ -1,5 +1,6 @@
 #pragma once
 
+#include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/IR/PassManager.h>
 
 namespace omill {
@@ -42,6 +43,13 @@ struct PipelineOptions {
   /// Opt-in; runs late in Phase 4 after ABI recovery.
   bool refine_signatures = false;
 
+  /// Use the blocks-as-functions lifting architecture instead of TraceLifter.
+  /// When enabled, the pipeline inserts IterativeBlockDiscoveryPass and
+  /// MergeBlockFunctionsPass instead of IterativeTargetResolutionPass.
+  /// Requires block-functions to already exist in the module (created by
+  /// BlockLifter before calling buildPipeline).
+  bool use_block_lifting = false;
+
   /// Run standard LLVM cleanup passes between stages.
   bool run_cleanup_passes = true;
 };
@@ -80,5 +88,9 @@ void registerAnalyses(llvm::FunctionAnalysisManager &FAM);
 
 /// Register all omill module-level analyses.
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM);
+
+/// Register omill's custom alias analysis with an AAManager.
+/// Call before PB.registerFunctionAnalyses() so the custom AA is included.
+void registerAAWithManager(llvm::AAManager &AAM);
 
 }  // namespace omill

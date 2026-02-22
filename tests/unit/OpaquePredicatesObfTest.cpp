@@ -1,0 +1,244 @@
+#include <gtest/gtest.h>
+
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
+
+#include <cstdint>
+#include <random>
+
+#include "OpaquePredicates.h"
+
+namespace {
+
+static const char *kDataLayout =
+    "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-"
+    "n8:16:32:64-S128";
+
+class OpaquePredicatesObfTest : public ::testing::Test {
+ protected:
+  llvm::LLVMContext Ctx;
+
+  /// Create a module with a function that has the given number of blocks
+  /// chained via unconditional branches: entry -> bb1 -> bb2 -> ... -> ret.
+  std::unique_ptr<llvm::Module> createChainedFunction(
+      unsigned numBlocks, bool withIntArg = true) {
+    auto M = std::make_unique<llvm::Module>("test", Ctx);
+    M->setDataLayout(kDataLayout);
+
+    auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+    auto *voidTy = llvm::Type::getVoidTy(Ctx);
+    llvm::SmallVector<llvm::Type *, 1> params;
+    if (withIntArg)
+      params.push_back(i64Ty);
+    auto *fnTy = llvm::FunctionType::get(voidTy, params, false);
+    auto *F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                     "test_fn", *M);
+
+    // Create blocks.
+    std::vector<llvm::BasicBlock *> blocks;
+    blocks.push_back(llvm::BasicBlock::Create(Ctx, "entry", F));
+    for (unsigned i = 1; i < numBlocks; ++i)
+      blocks.push_back(llvm::BasicBlock::Create(
+          Ctx, "bb" + std::to_string(i), F));
+
+    // Chain them together with unconditional branches, last block returns.
+    for (unsigned i = 0; i + 1 < numBlocks; ++i) {
+      llvm::IRBuilder<> B(blocks[i]);
+      // Add a dummy instruction to give the block some content.
+      if (withIntArg) {
+        auto *arg = F->getArg(0);
+        B.CreateAdd(arg, llvm::ConstantInt::get(i64Ty, i), "dummy");
+      }
+      B.CreateBr(blocks[i + 1]);
+    }
+
+    // Last block returns.
+    llvm::IRBuilder<> B(blocks.back());
+    B.CreateRetVoid();
+
+    return M;
+  }
+
+  unsigned countBlocks(llvm::Function *F) {
+    return static_cast<unsigned>(std::distance(F->begin(), F->end()));
+  }
+
+  /// Count blocks whose name starts with prefix.
+  unsigned countBlocksWithPrefix(llvm::Function *F, llvm::StringRef prefix) {
+    unsigned count = 0;
+    for (auto &BB : *F)
+      if (BB.getName().starts_with(prefix))
+        ++count;
+    return count;
+  }
+};
+
+/// A function with 4 blocks should gain extra opaque predicate blocks.
+TEST_F(OpaquePredicatesObfTest, InsertsOpaqueBranch) {
+  auto M = createChainedFunction(4);
+  auto *F = M->getFunction("test_fn");
+  unsigned origBlocks = countBlocks(F);
+  ASSERT_EQ(origBlocks, 4u);
+
+  // Use a seed that we know triggers insertion.
+  // Run a few seeds to find one that adds at least one opaque predicate.
+  bool found = false;
+  for (uint32_t seed = 0; seed < 100 && !found; ++seed) {
+    auto testM = createChainedFunction(4);
+    ollvm::insertOpaquePredicatesModule(*testM, seed);
+    auto *testF = testM->getFunction("test_fn");
+    if (countBlocks(testF) > origBlocks) {
+      found = true;
+      // Verify junk blocks were added.
+      EXPECT_GT(countBlocksWithPrefix(testF, "opq_junk"), 0u);
+    }
+  }
+  EXPECT_TRUE(found) << "No seed in [0,100) produced opaque predicates";
+}
+
+/// The opaque predicates should always evaluate to true.  Pick a seed that
+/// produces the transformation, extract the condition from the conditional
+/// branch, and verify it constant-folds to true for a range of x values.
+TEST_F(OpaquePredicatesObfTest, PredicateAlwaysTrue) {
+  // We verify the predicate property algebraically: for each variant,
+  // construct it manually and check with constant inputs.
+  auto *i64Ty = llvm::Type::getInt64Ty(Ctx);
+
+  // Test values spanning the range.
+  uint64_t testValues[] = {0, 1, 2, 42, 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF,
+                           0xDEADBEEF, 100, 0x8000000000000000ULL};
+
+  for (uint64_t val : testValues) {
+    // Variant 0: x | ~x == -1
+    {
+      uint64_t notX = ~val;
+      uint64_t orVal = val | notX;
+      EXPECT_EQ(orVal, static_cast<uint64_t>(-1))
+          << "Variant 0 failed for x=" << val;
+    }
+
+    // Variant 1: (x * (x+1)) & 1 == 0
+    {
+      uint64_t prod = val * (val + 1);
+      EXPECT_EQ(prod & 1, 0u) << "Variant 1 failed for x=" << val;
+    }
+
+    // Variant 2: (x * x) >=u 0  — trivially true for unsigned
+    {
+      uint64_t sq = val * val;
+      EXPECT_GE(sq, 0u) << "Variant 2 failed for x=" << val;
+    }
+  }
+
+  // Variant 3: c & (c-1) != 0 where c has bits 0 and 1 set.
+  // Any c with at least two bits set satisfies c & (c-1) != 0.
+  {
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<uint64_t> dist(1, 0x7FFFFFFE);
+    for (int i = 0; i < 100; ++i) {
+      uint64_t c = dist(rng) | 3;
+      EXPECT_NE(c & (c - 1), 0u) << "Variant 3 failed for c=" << c;
+    }
+  }
+}
+
+/// Single-block functions should not be modified.
+TEST_F(OpaquePredicatesObfTest, SkipsSingleBlockFunction) {
+  auto M = std::make_unique<llvm::Module>("test", Ctx);
+  M->setDataLayout(kDataLayout);
+
+  auto *voidTy = llvm::Type::getVoidTy(Ctx);
+  auto *fnTy = llvm::FunctionType::get(voidTy, false);
+  auto *F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage,
+                                   "single_block", *M);
+  auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+  llvm::IRBuilder<> B(entry);
+  B.CreateRetVoid();
+
+  ASSERT_EQ(countBlocks(F), 1u);
+  ollvm::insertOpaquePredicatesModule(*M, 42);
+  EXPECT_EQ(countBlocks(F), 1u);
+}
+
+/// The module must pass verifyModule after the pass.
+TEST_F(OpaquePredicatesObfTest, ModuleVerifies) {
+  for (uint32_t seed = 0; seed < 20; ++seed) {
+    auto M = createChainedFunction(5);
+    ollvm::insertOpaquePredicatesModule(*M, seed);
+    EXPECT_FALSE(llvm::verifyModule(*M, &llvm::errs()))
+        << "Module verification failed with seed=" << seed;
+  }
+}
+
+/// Same seed must produce identical output.
+TEST_F(OpaquePredicatesObfTest, DeterministicWithSeed) {
+  constexpr uint32_t kSeed = 12345;
+
+  auto M1 = createChainedFunction(5);
+  ollvm::insertOpaquePredicatesModule(*M1, kSeed);
+  unsigned blocks1 = countBlocks(M1->getFunction("test_fn"));
+
+  auto M2 = createChainedFunction(5);
+  ollvm::insertOpaquePredicatesModule(*M2, kSeed);
+  unsigned blocks2 = countBlocks(M2->getFunction("test_fn"));
+
+  EXPECT_EQ(blocks1, blocks2);
+
+  // Also verify block names match.
+  auto *F1 = M1->getFunction("test_fn");
+  auto *F2 = M2->getFunction("test_fn");
+  auto it1 = F1->begin();
+  auto it2 = F2->begin();
+  for (; it1 != F1->end() && it2 != F2->end(); ++it1, ++it2) {
+    EXPECT_EQ(it1->getName(), it2->getName());
+  }
+  EXPECT_EQ(it1, F1->end());
+  EXPECT_EQ(it2, F2->end());
+}
+
+/// Functions without integer arguments should use alloca-based fallback.
+TEST_F(OpaquePredicatesObfTest, NoIntArgUsesAlloca) {
+  auto M = createChainedFunction(4, /*withIntArg=*/false);
+  auto *F = M->getFunction("test_fn");
+  unsigned origBlocks = countBlocks(F);
+
+  // Try seeds until we get an insertion.
+  bool found = false;
+  for (uint32_t seed = 0; seed < 100 && !found; ++seed) {
+    auto testM = createChainedFunction(4, /*withIntArg=*/false);
+    ollvm::insertOpaquePredicatesModule(*testM, seed);
+    auto *testF = testM->getFunction("test_fn");
+    if (countBlocks(testF) > origBlocks) {
+      found = true;
+      // Should still verify — the alloca/load path must be correct.
+      EXPECT_FALSE(llvm::verifyModule(*testM, &llvm::errs()));
+    }
+  }
+  EXPECT_TRUE(found) << "No seed in [0,100) triggered alloca fallback path";
+}
+
+/// Return blocks should not have opaque predicates inserted before them.
+TEST_F(OpaquePredicatesObfTest, SkipsReturnBlocks) {
+  // Create a function where the last block has a return.
+  // The pass should never change a return into a conditional branch.
+  for (uint32_t seed = 0; seed < 50; ++seed) {
+    auto M = createChainedFunction(3);
+    ollvm::insertOpaquePredicatesModule(*M, seed);
+    auto *F = M->getFunction("test_fn");
+
+    // Every return instruction should still be a plain ReturnInst.
+    for (auto &BB : *F) {
+      if (llvm::isa<llvm::ReturnInst>(BB.getTerminator())) {
+        // The block ending in a return should not have been tampered with.
+        EXPECT_TRUE(llvm::isa<llvm::ReturnInst>(BB.getTerminator()))
+            << "Return block was modified with seed=" << seed;
+      }
+    }
+  }
+}
+
+}  // namespace

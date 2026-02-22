@@ -1,7 +1,9 @@
 add_executable(ollvm-obf
+  BogusControlFlow.cpp
   main.cpp
   Flattening.cpp
   Substitution.cpp
+  OpaquePredicates.cpp
   StringEncryption.cpp
   ConstantUnfolding.cpp
   Vectorize.cpp

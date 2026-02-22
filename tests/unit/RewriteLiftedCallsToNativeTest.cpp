@@ -10,9 +10,12 @@
 #include <llvm/Passes/PassBuilder.h>
 
 #include "omill/Analysis/CallingConventionAnalysis.h"
+#include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 
 #include <gtest/gtest.h>
+#include <memory>
+#include <optional>
 
 namespace {
 
@@ -65,7 +68,9 @@ class RewriteLiftedCallsToNativeTest : public ::testing::Test {
     return M;
   }
 
-  llvm::PreservedAnalyses runPass(llvm::Module &M) {
+  llvm::PreservedAnalyses runPass(
+      llvm::Module &M,
+      std::optional<omill::BinaryMemoryMap> memory_map = std::nullopt) {
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
@@ -78,6 +83,13 @@ class RewriteLiftedCallsToNativeTest : public ::testing::Test {
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
     MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
     MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+    std::shared_ptr<omill::BinaryMemoryMap> memory_map_holder =
+        std::make_shared<omill::BinaryMemoryMap>(
+            memory_map.has_value() ? std::move(*memory_map)
+                                   : omill::BinaryMemoryMap());
+    MAM.registerPass([memory_map_holder] {
+      return omill::BinaryMemoryAnalysis(*memory_map_holder);
+    });
 
     llvm::ModulePassManager MPM;
     MPM.addPass(omill::RewriteLiftedCallsToNativePass());
@@ -261,6 +273,107 @@ TEST_F(RewriteLiftedCallsToNativeTest, LeafFunctionNotRewritten) {
 
   EXPECT_TRUE(calls_leaf);
   EXPECT_FALSE(calls_native);
+}
+
+TEST_F(RewriteLiftedCallsToNativeTest, NativeDispatchJumpMaterializesRAX) {
+  auto M = createBaseModule();
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+
+  auto *dispatch_jump = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "__omill_dispatch_jump",
+      *M);
+
+  // Native wrapper-shaped function with a dynamic dispatch_jump.
+  auto *native_wrapper = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000_native", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_wrapper);
+    llvm::IRBuilder<> B(entry);
+    auto *state = native_wrapper->getArg(0);
+    auto *rax_gep = B.CreateConstGEP1_64(B.getInt8Ty(), state, 2216);
+    auto *dyn_pc = B.CreateLoad(i64_ty, rax_gep, "dyn_pc");
+    B.CreateCall(dispatch_jump, {state, dyn_pc, native_wrapper->getArg(2)});
+    B.CreateRet(native_wrapper->getArg(2));
+  }
+
+  runPass(*M);
+
+  bool has_dispatch_jump_call = false;
+  bool has_rax_store = false;
+  for (auto &BB : *native_wrapper) {
+    for (auto &I : BB) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (CI->getCalledFunction() == dispatch_jump) {
+          has_dispatch_jump_call = true;
+        }
+      }
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+      if (!SI) {
+        continue;
+      }
+      auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(SI->getPointerOperand());
+      if (!GEP || GEP->getNumOperands() < 2) {
+        continue;
+      }
+      if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1))) {
+        if (C->getZExtValue() == 2216) {
+          has_rax_store = true;
+        }
+      }
+    }
+  }
+
+  EXPECT_FALSE(has_dispatch_jump_call);
+  EXPECT_TRUE(has_rax_store);
+}
+
+TEST_F(RewriteLiftedCallsToNativeTest,
+       NativeDispatchJumpCanonicalizesSkewedImageTarget) {
+  auto M = createBaseModule();
+
+  auto *dispatch_jump = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "__omill_dispatch_jump",
+      *M);
+
+  auto *native_wrapper = llvm::Function::Create(
+      liftedFnTy(), llvm::Function::ExternalLinkage, "sub_401000_native", *M);
+  {
+    auto *entry = llvm::BasicBlock::Create(Ctx, "entry", native_wrapper);
+    llvm::IRBuilder<> B(entry);
+    auto *state = native_wrapper->getArg(0);
+    B.CreateCall(dispatch_jump,
+                 {state, B.getInt64(0x100001A6AULL), native_wrapper->getArg(2)});
+    B.CreateRet(native_wrapper->getArg(2));
+  }
+
+  omill::BinaryMemoryMap map;
+  map.setImageBase(0x140000000ULL);
+  map.setImageSize(0x300000ULL);
+  runPass(*M, map);
+
+  bool saw_rax_store = false;
+  bool saw_expected_target = false;
+  for (auto &BB : *native_wrapper) {
+    for (auto &I : BB) {
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+      if (!SI)
+        continue;
+      auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(SI->getPointerOperand());
+      if (!GEP || GEP->getNumOperands() < 2)
+        continue;
+      auto *off = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
+      if (!off || off->getZExtValue() != 2216)
+        continue;
+      saw_rax_store = true;
+      if (auto *v = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand())) {
+        if (v->getZExtValue() == 0x140001A6AULL)
+          saw_expected_target = true;
+      }
+    }
+  }
+
+  EXPECT_TRUE(saw_rax_store);
+  EXPECT_TRUE(saw_expected_target);
 }
 
 }  // namespace

@@ -4,6 +4,7 @@
 #include <llvm/Passes/PassBuilder.h>
 
 #include "omill/Analysis/RemillIntrinsicAnalysis.h"
+#include "omill/Analysis/SegmentsAA.h"
 
 namespace omill {
 

@@ -1,0 +1,251 @@
+#include "omill/Passes/IterativeBlockDiscovery.h"
+
+#include <llvm/ADT/DenseSet.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/Module.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
+
+#include "omill/Passes/ConstantMemoryFolding.h"
+#include "omill/BC/BlockLifterAnalysis.h"
+
+namespace omill {
+
+namespace {
+
+/// Prefix used by BlockLifter for block-function names.
+static constexpr const char *kBlockPrefix = "blk_";
+
+/// Check if a function is a block-function.
+bool isBlockFunction(const llvm::Function &F) {
+  return F.getName().starts_with(kBlockPrefix) && !F.isDeclaration();
+}
+
+/// Collect all constant dispatch target PCs from block-functions.
+/// Returns PCs where no corresponding blk_<hex> definition exists.
+llvm::DenseSet<uint64_t> collectNewTargetPCs(llvm::Module &M) {
+  llvm::DenseSet<uint64_t> new_pcs;
+  for (auto &F : M) {
+    if (!isBlockFunction(F))
+      continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        auto name = callee->getName();
+        if (name != "__omill_dispatch_jump" && name != "__omill_dispatch_call")
+          continue;
+        if (call->arg_size() < 2)
+          continue;
+        auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!pc_arg)
+          continue;
+        uint64_t target_pc = pc_arg->getZExtValue();
+        if (target_pc == 0)
+          continue;
+        // Check if a block-function already exists for this target.
+        char target_name[64];
+        snprintf(target_name, sizeof(target_name), "blk_%llx",
+                 (unsigned long long)target_pc);
+        auto *target_fn = M.getFunction(target_name);
+        if (!target_fn || target_fn->isDeclaration())
+          new_pcs.insert(target_pc);
+      }
+    }
+  }
+  return new_pcs;
+}
+
+/// Count the total number of unresolved dispatch calls in block-functions.
+unsigned countUnresolvedBlockDispatches(llvm::Module &M) {
+  unsigned count = 0;
+  for (auto &F : M) {
+    if (!isBlockFunction(F))
+      continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        auto name = callee->getName();
+        if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
+          ++count;
+      }
+    }
+  }
+  return count;
+}
+
+/// Replace dispatch calls that have a constant target PC and the callee
+/// exists as a block-function with a musttail call to that block-function.
+/// This "resolves" the dispatch into a direct block-to-block edge.
+bool resolveConstantDispatches(llvm::Module &M) {
+  bool changed = false;
+  llvm::SmallVector<std::pair<llvm::CallInst *, llvm::Function *>, 16>
+      to_replace;
+
+  for (auto &F : M) {
+    if (!isBlockFunction(F))
+      continue;
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+        if (!call)
+          continue;
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        auto name = callee->getName();
+        if (name != "__omill_dispatch_jump" && name != "__omill_dispatch_call")
+          continue;
+
+        // Check if PC argument is constant.
+        if (call->arg_size() < 2)
+          continue;
+        auto *pc_arg =
+            llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+        if (!pc_arg)
+          continue;
+        uint64_t target_pc = pc_arg->getZExtValue();
+        if (target_pc == 0)
+          continue;
+
+        // Find the corresponding block-function.
+        char target_name[64];
+        snprintf(target_name, sizeof(target_name), "blk_%llx",
+                 (unsigned long long)target_pc);
+        auto *target_fn = M.getFunction(target_name);
+        if (!target_fn || target_fn->isDeclaration())
+          continue;
+
+        to_replace.push_back({call, target_fn});
+      }
+    }
+  }
+
+  for (auto &[call, target_fn] : to_replace) {
+    // The dispatch call pattern is:
+    //   %r = call @__omill_dispatch_jump(state, pc, mem)
+    //   ret %r
+    // Replace with:
+    //   %r = musttail call @blk_xxx(state, pc, mem)
+    //   ret %r
+
+    // Only use musttail if the call is in strict tail position:
+    // the call's only user must be a ReturnInst and the call and ret
+    // must be the last two instructions in the block.
+    bool can_musttail = false;
+    if (call->hasOneUse()) {
+      auto *user = call->user_back();
+      if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(user)) {
+        if (ret->getParent() == call->getParent() &&
+            &call->getParent()->back() == ret) {
+          can_musttail = true;
+        }
+      }
+    }
+
+    auto *new_call = llvm::CallInst::Create(
+        target_fn->getFunctionType(), target_fn,
+        {call->getArgOperand(0), call->getArgOperand(1),
+         call->getArgOperand(2)},
+        "", call->getIterator());
+    if (can_musttail)
+      new_call->setTailCallKind(llvm::CallInst::TCK_MustTail);
+    call->replaceAllUsesWith(new_call);
+    call->eraseFromParent();
+    changed = true;
+  }
+
+  return changed;
+}
+
+}  // namespace
+
+llvm::PreservedAnalyses IterativeBlockDiscoveryPass::run(
+    llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
+
+  // Check if there are any block-functions to process.
+  bool has_block_fns = false;
+  for (auto &F : M) {
+    if (isBlockFunction(F)) {
+      has_block_fns = true;
+      break;
+    }
+  }
+  if (!has_block_fns)
+    return llvm::PreservedAnalyses::all();
+
+  unsigned prev_unresolved = countUnresolvedBlockDispatches(M);
+  if (prev_unresolved == 0)
+    return llvm::PreservedAnalyses::all();
+
+  // Try to get the block-lifting callback.  If registered, we can lift
+  // new blocks at PCs discovered during optimization.  If not registered,
+  // we can only resolve dispatches to existing block-functions.
+  BlockLiftCallback lift_block;
+  auto *lift_result = MAM.getCachedResult<BlockLiftAnalysis>(M);
+  if (lift_result)
+    lift_block = lift_result->lift_block;
+
+  bool ever_changed = false;
+  unsigned iteration = 0;
+
+  do {
+    // Step 1: Run lightweight optimization on all block-functions.
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(ConstantMemoryFoldingPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
+      adaptor.run(M, MAM);
+    }
+
+    // Step 2: If we have a lift callback, discover new target PCs and
+    // lift blocks that don't exist yet.
+    if (lift_block) {
+      auto new_pcs = collectNewTargetPCs(M);
+      for (uint64_t pc : new_pcs) {
+        if (lift_block(pc))
+          ever_changed = true;
+      }
+    }
+
+    // Step 3: Resolve dispatch calls with constant targets.
+    bool resolved = resolveConstantDispatches(M);
+    if (resolved)
+      ever_changed = true;
+
+    unsigned curr_unresolved = countUnresolvedBlockDispatches(M);
+    if (curr_unresolved < prev_unresolved)
+      ever_changed = true;
+
+    // Fixed point: no more dispatches resolved.
+    if (curr_unresolved >= prev_unresolved)
+      break;
+
+    prev_unresolved = curr_unresolved;
+    ++iteration;
+  } while (iteration < max_iterations_);
+
+  return ever_changed ? llvm::PreservedAnalyses::none()
+                      : llvm::PreservedAnalyses::all();
+}
+
+}  // namespace omill

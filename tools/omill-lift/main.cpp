@@ -15,7 +15,9 @@
 #include <remill/Arch/Arch.h>
 #include <remill/Arch/Name.h>
 #include <remill/BC/IntrinsicTable.h>
-#include <remill/BC/TraceLifter.h>
+#include "omill/BC/TraceLifter.h"
+#include "omill/BC/BlockLifter.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 #include <remill/BC/Util.h>
 #include <remill/OS/OS.h>
 
@@ -30,6 +32,7 @@
 #include "omill/Omill.h"
 
 #include <deque>
+#include <memory>
 #include <vector>
 
 using namespace llvm;
@@ -79,10 +82,15 @@ static cl::opt<bool> ResolveExceptions(
     cl::desc("Resolve forced exceptions (ud2/int3) via .pdata SEH handlers"),
     cl::init(false));
 
+static cl::opt<bool> BlockLift(
+    "block-lift",
+    cl::desc("Use blocks-as-functions architecture for iterative discovery"),
+    cl::init(false));
+
 namespace {
 
 /// In-memory trace manager for remill lifting.
-class BufferTraceManager : public remill::TraceManager {
+class BufferTraceManager : public omill::TraceManager {
  public:
   void setCode(const uint8_t *data, size_t size, uint64_t base) {
     code_[base] = {data, data + size};
@@ -120,6 +128,42 @@ class BufferTraceManager : public remill::TraceManager {
   std::map<uint64_t, std::vector<uint8_t>> code_;
   std::map<uint64_t, llvm::Function *> lifted_;
   uint64_t base_addr_ = 0;
+};
+
+/// In-memory block manager for block-lifting mode.
+class BufferBlockManager : public omill::BlockManager {
+ public:
+  void setCode(const uint8_t *data, size_t size, uint64_t base) {
+    code_[base] = {data, data + size};
+  }
+
+  void SetLiftedBlockDefinition(uint64_t addr,
+                                 llvm::Function *fn) override {
+    blocks_[addr] = fn;
+  }
+
+  llvm::Function *GetLiftedBlockDeclaration(uint64_t addr) override {
+    auto it = blocks_.find(addr);
+    return (it != blocks_.end()) ? it->second : nullptr;
+  }
+
+  llvm::Function *GetLiftedBlockDefinition(uint64_t addr) override {
+    return GetLiftedBlockDeclaration(addr);
+  }
+
+  bool TryReadExecutableByte(uint64_t addr, uint8_t *out) override {
+    for (auto &[base, data] : code_) {
+      if (addr >= base && addr < base + data.size()) {
+        *out = data[addr - base];
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  std::map<uint64_t, std::vector<uint8_t>> code_;
+  std::map<uint64_t, llvm::Function *> blocks_;
 };
 
 struct SectionInfo {
@@ -391,23 +435,28 @@ int main(int argc, char **argv) {
   }
 
   // Lift
-  remill::TraceLifter lifter(arch.get(), manager);
+  omill::TraceLifter lifter(arch.get(), manager);
+
+  // If available, lift the handler first so Remill reuses a canonical
+  // sub_<va> function instead of creating a late duplicate (sub_<va>.1).
+  uint64_t auto_handler_va = 0;
+  if (ResolveExceptions) {
+    if (auto *entry = pe.exception_info.lookup(func_va)) {
+      auto_handler_va = entry->handler_va;
+    }
+  }
+  if (auto_handler_va != 0 && auto_handler_va != func_va) {
+    errs() << "Auto-lifting exception handler at 0x"
+           << Twine::utohexstr(auto_handler_va) << "\n";
+    if (!lifter.Lift(auto_handler_va)) {
+      errs() << "WARNING: failed to lift handler at 0x"
+             << Twine::utohexstr(auto_handler_va) << "\n";
+    }
+  }
+
   if (!lifter.Lift(func_va)) {
     errs() << "TraceLifter::Lift() failed\n";
     return 1;
-  }
-
-  // Auto-lift exception handlers for the target function.
-  if (ResolveExceptions) {
-    auto *entry = pe.exception_info.lookup(func_va);
-    if (entry && entry->handler_va != 0) {
-      errs() << "Auto-lifting exception handler at 0x"
-             << Twine::utohexstr(entry->handler_va) << "\n";
-      if (!lifter.Lift(entry->handler_va)) {
-        errs() << "WARNING: failed to lift handler at 0x"
-               << Twine::utohexstr(entry->handler_va) << "\n";
-      }
-    }
   }
   errs() << "Lifting complete\n";
 
@@ -428,26 +477,74 @@ int main(int argc, char **argv) {
   CGSCCAnalysisManager CGAM;
   ModuleAnalysisManager MAM;
 
-  // Register BinaryMemoryAnalysis with our PE memory map.
-  MAM.registerPass([&] {
-    return omill::BinaryMemoryAnalysis(pe.memory_map);
+  // Register custom module analyses first and keep backing storage stable.
+  auto memory_map_holder =
+      std::make_shared<omill::BinaryMemoryMap>(pe.memory_map);
+  MAM.registerPass([memory_map_holder] {
+    return omill::BinaryMemoryAnalysis(*memory_map_holder);
   });
 
-  // Register ExceptionInfoAnalysis with our parsed .pdata.
+  std::shared_ptr<omill::ExceptionInfo> exception_info_holder;
   if (ResolveExceptions) {
-    MAM.registerPass([&] {
-      return omill::ExceptionInfoAnalysis(std::move(pe.exception_info));
+    exception_info_holder =
+        std::make_shared<omill::ExceptionInfo>(std::move(pe.exception_info));
+    MAM.registerPass([exception_info_holder] {
+      return omill::ExceptionInfoAnalysis(*exception_info_holder);
     });
   }
 
+  // Build AAManager with omill's custom SegmentsAA before standard
+  // registration so it's included in LLVM's AA pipeline.
+  FAM.registerPass([&] {
+    auto AAM = PB.buildDefaultAAPipeline();
+    omill::registerAAWithManager(AAM);
+    return AAM;
+  });
+
   PB.registerModuleAnalyses(MAM);
   PB.registerCGSCCAnalyses(CGAM);
-  PB.registerFunctionAnalyses(FAM);
+  PB.registerFunctionAnalyses(FAM);  // AAManager already registered, skipped.
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
   omill::registerAnalyses(FAM);
-  omill::registerModuleAnalyses(MAM);
+  // Register remaining module analyses without overriding custom ones above.
+  MAM.registerPass([&] { return omill::CallingConventionAnalysis(); });
+  MAM.registerPass([&] { return omill::CallGraphAnalysis(); });
+  MAM.registerPass([&] { return omill::LiftedFunctionAnalysis(); });
+  if (!ResolveExceptions) {
+    MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
+  }
+
+  // Block-lifting mode: set up BlockLifter and register the analysis
+  // so IterativeBlockDiscoveryPass can lift new blocks on the fly.
+  std::unique_ptr<BufferBlockManager> block_manager;
+  std::unique_ptr<omill::BlockLifter> block_lifter;
+  if (BlockLift) {
+    block_manager = std::make_unique<BufferBlockManager>();
+    // Share code sections with the block manager.
+    for (auto &sec : pe.code_sections) {
+      auto &data = pe.section_storage[sec.storage_index];
+      block_manager->setCode(data.data(), data.size(), sec.va);
+    }
+    block_lifter = std::make_unique<omill::BlockLifter>(
+        arch.get(), *block_manager);
+
+    // Do initial block-lifting for the entry function.
+    block_lifter->LiftReachable(func_va);
+    errs() << "Block-lifting initial reachable blocks complete\n";
+
+    // Register the lift callback so the discovery pass can lift more.
+    omill::BlockLiftCallback lift_cb =
+        [&](uint64_t pc) -> bool {
+          llvm::SmallVector<uint64_t, 4> targets;
+          auto *fn = block_lifter->LiftBlock(pc, targets);
+          return fn != nullptr;
+        };
+    MAM.registerPass([lift_cb] {
+      return omill::BlockLiftAnalysis(lift_cb);
+    });
+  }
 
   // Run the main pipeline (without ABI first)
   omill::PipelineOptions opts;
@@ -457,6 +554,7 @@ int main(int argc, char **argv) {
   opts.max_resolution_iterations = MaxIterations;
   opts.refine_signatures = RefineSignatures;
   opts.interprocedural_const_prop = IPCP;
+  opts.use_block_lifting = BlockLift;
   {
     ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);

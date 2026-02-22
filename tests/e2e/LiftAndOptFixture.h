@@ -9,7 +9,7 @@
 
 #include <remill/Arch/Arch.h>
 #include <remill/Arch/Name.h>
-#include <remill/BC/TraceLifter.h>
+#include "omill/BC/TraceLifter.h"
 #include <remill/BC/Util.h>
 #include <remill/OS/OS.h>
 
@@ -30,7 +30,7 @@
 namespace omill::e2e {
 
 /// A TraceManager implementation that reads from an in-memory byte buffer.
-class BufferTraceManager : public remill::TraceManager {
+class BufferTraceManager : public omill::TraceManager {
  public:
   void setCode(const uint8_t *data, size_t size, uint64_t base) {
     code_.clear();
@@ -74,7 +74,7 @@ class BufferTraceManager : public remill::TraceManager {
   /// Tries both RIP-relative and image-base-relative jump table patterns.
   void ForEachDevirtualizedTarget(
       const remill::Instruction &inst,
-      std::function<void(uint64_t, remill::DevirtualizedTargetKind)> func)
+      std::function<void(uint64_t, omill::DevirtualizedTargetKind)> func)
       override {
     if (!memory_map_)
       return;
@@ -94,7 +94,7 @@ class BufferTraceManager : public remill::TraceManager {
     }
 
     for (uint64_t target : targets) {
-      func(target, remill::DevirtualizedTargetKind::kTraceLocal);
+      func(target, omill::DevirtualizedTargetKind::kTraceLocal);
     }
   }
 

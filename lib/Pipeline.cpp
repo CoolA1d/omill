@@ -2,6 +2,10 @@
 
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/DCE.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
@@ -23,7 +27,9 @@
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Analysis/RemillIntrinsicAnalysis.h"
+#include "omill/Analysis/SegmentsAA.h"
 #include "omill/Passes/CFGRecovery.h"
+#include "omill/Passes/ControlFlowUnflattener.h"
 #include "omill/Passes/OptimizeState.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Analysis/ExceptionInfo.h"
@@ -49,6 +55,18 @@
 #include "omill/Passes/IterativeTargetResolution.h"
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/InlineJumpTargets.h"
+#include "omill/BC/BlockLifterAnalysis.h"
+#include "omill/Passes/IterativeBlockDiscovery.h"
+#include "omill/Passes/MergeBlockFunctions.h"
+#include "omill/Passes/JumpTableConcretizer.h"
+#include "omill/Passes/IndirectCallResolver.h"
+#include "omill/Passes/JunkInstructionRemover.h"
+#include "omill/Passes/KnownIndexSelect.h"
+#include "omill/Passes/MemoryCoalesce.h"
+#include "omill/Passes/PartialOverlapDSE.h"
+#include "omill/Passes/PointersHoisting.h"
+#include "omill/Passes/SynthesizeFlags.h"
+#include "omill/Passes/StackConcretization.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -151,6 +169,9 @@ void buildStateOptimizationPipeline(llvm::FunctionPassManager &FPM,
   if (!envDisabled("OMILL_SKIP_RECOVER_STACK_FRAME_TYPES")) {
     FPM.addPass(SkipOnLiftedControlTransferPass<RecoverStackFrameTypesPass>());
   }
+  if (!envDisabled("OMILL_SKIP_STACK_CONCRETIZATION")) {
+    FPM.addPass(SkipOnLiftedControlTransferPass<StackConcretizationPass>());
+  }
   if (!envDisabled("OMILL_SKIP_STATE_PRE_INSTCOMBINE")) {
     FPM.addPass(llvm::InstCombinePass());
   }
@@ -229,6 +250,193 @@ void buildControlFlowPipeline(llvm::FunctionPassManager &FPM) {
   }
 }
 
+namespace {
+
+// ABI helper: fold direct calls to functions that are exactly
+// `ret <constant>`, exposing concrete jump targets in callers.
+struct FoldCallsToConstantReturnPass
+    : llvm::PassInfoMixin<FoldCallsToConstantReturnPass> {
+  static bool pointsToOnlyLocalAllocas(const llvm::Value *Ptr) {
+    if (!Ptr) {
+      return false;
+    }
+
+    llvm::SmallVector<llvm::Value *, 4> objs;
+    if (!llvm::getUnderlyingObjectsForCodeGen(Ptr, objs)) {
+      auto *obj = llvm::getUnderlyingObject(Ptr);
+      return llvm::isa<llvm::AllocaInst>(obj);
+    }
+
+    if (objs.empty()) {
+      return false;
+    }
+    for (auto *obj : objs) {
+      obj = obj->stripPointerCasts();
+      if (!llvm::isa<llvm::AllocaInst>(obj)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static llvm::Constant *getFoldableConstantReturn(llvm::Function *F) {
+    if (!F || F->isDeclaration() || F->getReturnType()->isVoidTy())
+      return nullptr;
+
+    llvm::Constant *ret_const = nullptr;
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        if (auto *Ret = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+          auto *C = llvm::dyn_cast<llvm::Constant>(Ret->getReturnValue());
+          if (!C)
+            return nullptr;
+          if (!ret_const) {
+            ret_const = C;
+          } else if (ret_const != C) {
+            return nullptr;
+          }
+          continue;
+        }
+
+        if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          if (SI->isVolatile())
+            return nullptr;
+          if (!pointsToOnlyLocalAllocas(SI->getPointerOperand())) {
+            return nullptr;
+          }
+          continue;
+        }
+
+        if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+          if (LI->isVolatile())
+            return nullptr;
+          if (!pointsToOnlyLocalAllocas(LI->getPointerOperand())) {
+            return nullptr;
+          }
+          continue;
+        }
+
+        if (auto *II = llvm::dyn_cast<llvm::IntrinsicInst>(&I)) {
+          switch (II->getIntrinsicID()) {
+            case llvm::Intrinsic::assume:
+            case llvm::Intrinsic::lifetime_start:
+            case llvm::Intrinsic::lifetime_end:
+            case llvm::Intrinsic::experimental_noalias_scope_decl:
+            case llvm::Intrinsic::stacksave:
+            case llvm::Intrinsic::stackrestore:
+              continue;
+            case llvm::Intrinsic::memset:
+            case llvm::Intrinsic::memset_inline: {
+              auto *MI = llvm::cast<llvm::MemSetInst>(II);
+              if (!pointsToOnlyLocalAllocas(MI->getDest())) {
+                return nullptr;
+              }
+              continue;
+            }
+            case llvm::Intrinsic::memcpy:
+            case llvm::Intrinsic::memcpy_inline:
+            case llvm::Intrinsic::memmove: {
+              auto *MTI = llvm::cast<llvm::MemTransferInst>(II);
+              if (!pointsToOnlyLocalAllocas(MTI->getDest()) ||
+                  !pointsToOnlyLocalAllocas(MTI->getSource())) {
+                return nullptr;
+              }
+              continue;
+            }
+            default:
+              return nullptr;
+          }
+        }
+
+        if (llvm::isa<llvm::AtomicRMWInst>(&I) ||
+            llvm::isa<llvm::AtomicCmpXchgInst>(&I) ||
+            llvm::isa<llvm::FenceInst>(&I) ||
+            llvm::isa<llvm::CallBase>(&I)) {
+          return nullptr;
+        }
+      }
+    }
+
+    return ret_const;
+  }
+
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+    llvm::SmallVector<std::pair<llvm::Function *, llvm::Constant *>, 32>
+        foldable_fns;
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (auto *C = getFoldableConstantReturn(&F)) {
+        foldable_fns.push_back({&F, C});
+      }
+    }
+
+    struct Replacement {
+      llvm::CallInst *call;
+      llvm::Constant *value;
+    };
+    llvm::SmallVector<Replacement, 32> replacements;
+
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+          if (!CI || CI->getType()->isVoidTy())
+            continue;
+          auto *Callee = CI->getCalledFunction();
+          if (!Callee)
+            continue;
+          auto *C = getFoldableConstantReturn(Callee);
+          if (!C || C->getType() != CI->getType())
+            continue;
+          replacements.push_back({CI, C});
+        }
+      }
+    }
+
+    bool changed = false;
+
+    for (auto &R : replacements) {
+      R.call->replaceAllUsesWith(R.value);
+      R.call->eraseFromParent();
+      changed = true;
+    }
+
+    for (auto &[F, C] : foldable_fns) {
+      if (F->empty())
+        continue;
+
+      bool already_canonical = false;
+      if (F->size() == 1) {
+        auto &BB = F->front();
+        if (BB.size() == 1) {
+          if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator())) {
+            already_canonical = (RI->getReturnValue() == C);
+          }
+        }
+      }
+      if (already_canonical)
+        continue;
+
+      F->deleteBody();
+      auto *entry = llvm::BasicBlock::Create(F->getContext(), "entry", F);
+      llvm::ReturnInst::Create(F->getContext(), C, entry);
+      changed = true;
+    }
+
+    if (!changed)
+      return llvm::PreservedAnalyses::all();
+    return llvm::PreservedAnalyses::none();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+}  // namespace
+
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   // Stack frame recovery runs per-function.
   {
@@ -264,6 +472,13 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::AlwaysInlinerPass());
   }
 
+  // Inlining lifted functions into _native wrappers can re-introduce
+  // dispatch_call/dispatch_jump artifacts. Rewrite again so wrappers don't
+  // keep State alive due late-emitted dispatch shims.
+  if (!envDisabled("OMILL_SKIP_ABI_REWRITE_LIFTED_LATE")) {
+    MPM.addPass(RewriteLiftedCallsToNativePass());
+  }
+
   // SROA only: decompose State alloca to expose SSA values for dispatch
   // resolution.  No InstCombine, GVN, or SimplifyCFG yet.
   if (!envDisabled("OMILL_SKIP_ABI_SROA")) {
@@ -288,10 +503,22 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
 #endif
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::GVNPass());
+    FPM.addPass(PointersHoistingPass());
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopDeletionPass()));
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // After per-function cleanup, some native helpers collapse to a constant
+  // return. Fold direct calls to those helpers in their callers.
+  if (!envDisabled("OMILL_SKIP_ABI_FOLD_CONST_RET_CALLS")) {
+    MPM.addPass(FoldCallsToConstantReturnPass());
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::DCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
@@ -303,11 +530,17 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
     FPM.addPass(SkipOnLiftedControlTransferPass<RecoverStackFramePass>());
     FPM.addPass(SkipOnLiftedControlTransferPass<RecoverStackFrameTypesPass>());
   }
+  if (!envDisabled("OMILL_SKIP_DEOBF_STACK_CONCRETIZATION")) {
+    FPM.addPass(SkipOnLiftedControlTransferPass<StackConcretizationPass>());
+  }
   if (!envDisabled("OMILL_SKIP_DEOBF_PRE_SROA")) {
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(SimplifyVectorReassemblyPass());
+  }
+  if (!envDisabled("OMILL_SKIP_DEOBF_JUNK_REMOVAL")) {
+    FPM.addPass(JunkInstructionRemoverPass());
   }
   if (!envDisabled("OMILL_SKIP_DEOBF_OPT_STATE_REDUNDANT")) {
     FPM.addPass(OptimizeStatePass(OptimizePhases::RedundantBytes));
@@ -324,6 +557,10 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
     // Recover string constants from inttoptr(address) patterns.
     FPM.addPass(RecoverGlobalTypesPass());
   }
+  if (!envDisabled("OMILL_SKIP_DEOBF_MEMORY_COALESCE")) {
+    FPM.addPass(MemoryCoalescePass());
+    FPM.addPass(PartialOverlapDSEPass());
+  }
   if (!envDisabled("OMILL_SKIP_DEOBF_POST_CONST_CLEANUP")) {
     // LLVM cleanup to fold constants exposed by memory folding.
     FPM.addPass(llvm::InstCombinePass());
@@ -332,6 +569,12 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(OptimizeStatePass(OptimizePhases::Roundtrip));
     FPM.addPass(llvm::DCEPass());
+  }
+  // Control-flow unflattening: after MBA simplification, constant folding,
+  // and dead-path elimination have resolved state variable computations.
+  if (!envDisabled("OMILL_SKIP_DEOBF_CFF_UNFLATTEN")) {
+    FPM.addPass(ControlFlowUnflattenerPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
   }
   // Promote stack allocas with all-constant stores to global constants.
   // After xorstr folding, decrypted strings are constant stores to allocas;
@@ -354,6 +597,8 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
   }
   // Clean up dead PEB-walking loop after import resolution.
   if (!envDisabled("OMILL_SKIP_DEOBF_FINAL_CLEANUP")) {
+    FPM.addPass(KnownIndexSelectPass());
+    FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
   }
@@ -471,7 +716,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // target discovery during lifting) survive — SimplifyCFG in Phase 1
   // cleanup merges blocks and destroys those names.  __remill_jump is
   // still present at this point (not lowered until Phase 3).
-  if (opts.deobfuscate && !envDisabled("OMILL_SKIP_INLINE_JUMP_TARGETS")) {
+  if (opts.deobfuscate && !opts.use_block_lifting &&
+      !envDisabled("OMILL_SKIP_INLINE_JUMP_TARGETS")) {
     MPM.addPass(InlineJumpTargetsPass());
   }
 
@@ -491,6 +737,16 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 
     llvm::FunctionPassManager FPM;
     buildStateOptimizationPipeline(FPM, opts.deobfuscate);
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Synthesize flag patterns: after SROA/mem2reg promotes flag values to
+  // SSA, recognize xor(SF, OF) patterns and fold to icmp slt.  Follow
+  // with InstCombine to fold compound patterns (JGE, JLE, JG).
+  if (!envDisabled("OMILL_SKIP_SYNTHESIZE_FLAGS")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(SynthesizeFlagsPass());
+    FPM.addPass(llvm::InstCombinePass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
@@ -558,8 +814,27 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Phase 3.55: Proactive jump table concretization.
+  // Runs after Phase 3.5 has folded program_counter and resolved IAT calls,
+  // but before iterative target resolution.  Converts dispatch_jump sites
+  // with jump table patterns (base + idx * stride loads from binary memory)
+  // into switch instructions.
+  if (opts.resolve_indirect_targets || opts.use_block_lifting) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(JumpTableConcretizerPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
   // Phase 3.6: Iterative indirect target resolution.
-  if (opts.resolve_indirect_targets) {
+  if (opts.use_block_lifting) {
+    // Block-lifting mode: optimize block-functions, resolve constant
+    // dispatch targets, and convert them to direct musttail calls.
+    MPM.addPass(
+        IterativeBlockDiscoveryPass(opts.max_resolution_iterations));
+    // Merge block-functions back into multi-block trace functions.
+    MPM.addPass(MergeBlockFunctionsPass());
+    MPM.addPass(llvm::GlobalDCEPass());
+  } else if (opts.resolve_indirect_targets) {
     MPM.addPass(
         IterativeTargetResolutionPass(opts.max_resolution_iterations));
   }
@@ -576,6 +851,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     FPM.addPass(ConstantMemoryFoldingPass());
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(IndirectCallResolverPass());
     FPM.addPass(ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
     FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
@@ -624,6 +900,11 @@ void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return BinaryMemoryAnalysis(); });
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
   MAM.registerPass([&] { return ExceptionInfoAnalysis(); });
+  MAM.registerPass([&] { return BlockLiftAnalysis(); });
+}
+
+void registerAAWithManager(llvm::AAManager &AAM) {
+  AAM.registerFunctionAnalysis<SegmentsAA>();
 }
 
 }  // namespace omill

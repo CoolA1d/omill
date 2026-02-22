@@ -15,8 +15,9 @@ namespace omill {
 
 namespace {
 
-// State offsets for handler arg registers (Win64 ABI).
-static constexpr unsigned kStateRCX = 2248;
+// State offsets for handler arg registers (Win64 SEH ABI).
+// RCX = EXCEPTION_RECORD*, RDX = EstablisherFrame,
+// R8 = CONTEXT*, R9 = DISPATCHER_CONTEXT*
 static constexpr unsigned kStateRDX = 2264;
 static constexpr unsigned kStateR8 = 2344;
 static constexpr unsigned kStateR9 = 2360;
@@ -29,6 +30,7 @@ static void storeStateI64(llvm::IRBuilder<> &Builder, llvm::Value *state,
   Builder.CreateStore(val, ptr);
 }
 
+/// If the function starts with `ud2; jmp rel32`, return the direct jump target.
 }  // namespace
 
 llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
@@ -99,13 +101,13 @@ llvm::PreservedAnalyses ResolveForcedExceptionsPass::run(
     llvm::Value *state = CI->getArgOperand(0);
     llvm::Value *mem = CI->getArgOperand(2);
 
-    // Store handler args into State (Win64 SEH ABI):
-    //   RCX = 0 (EXCEPTION_RECORD* — not needed for CFF)
-    //   RDX = 0 (EstablisherFrame — not needed for CFF)
-    //   R8  = synthetic CONTEXT VA (Rip = exception address)
-    //   R9  = synthetic DC VA (DISPATCHER_CONTEXT* — has HandlerData)
-    storeStateI64(Builder, state, kStateRCX, Builder.getInt64(0));
-    storeStateI64(Builder, state, kStateRDX, Builder.getInt64(0));
+    // Seed Win64 SEH handler argument registers into State.
+    // R8  = CONTEXT* (synthetic; [+0xF8] = Rip = exception VA)
+    // R9  = DISPATCHER_CONTEXT* (synthetic; [+0x38] = HandlerData,
+    //        [+0x08] = ImageBase)
+    // RDX = EstablisherFrame (= exception VA for UD2/INT3 entries)
+    storeStateI64(Builder, state, kStateRDX,
+                  Builder.getInt64(rt_entry->begin_va));
     storeStateI64(Builder, state, kStateR8,
                   Builder.getInt64(rt_entry->ctx_synthetic_va));
     storeStateI64(Builder, state, kStateR9,

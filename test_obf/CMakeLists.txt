@@ -101,6 +101,52 @@ if(OMILL_OLLVM_OBF_VECTORIZE)
   endif()
 endif()
 
+# --------------------------------------------------------------------------
+# Add OLLVM-obfuscated algorithm exports to obf_test.dll.
+# --------------------------------------------------------------------------
+
+set(_obf_algo_src "${CMAKE_CURRENT_SOURCE_DIR}/src/obf_algo_funcs.cpp")
+set(_obf_algo_clean_bc "${CMAKE_CURRENT_BINARY_DIR}/obf_algo_funcs.bc")
+set(_obf_algo_obf_bc "${CMAKE_CURRENT_BINARY_DIR}/obf_algo_funcs_obf.bc")
+set(_obf_algo_obf_obj "${CMAKE_CURRENT_BINARY_DIR}/obf_algo_funcs_obf.obj")
+
+add_custom_command(
+  OUTPUT ${_obf_algo_clean_bc}
+  COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
+    -target x86_64-pc-windows-msvc
+    ${_obf_algo_src}
+    -o ${_obf_algo_clean_bc}
+  DEPENDS ${_obf_algo_src}
+  COMMENT "Compiling obf_algo_funcs.cpp to bitcode"
+)
+
+add_custom_command(
+  OUTPUT ${_obf_algo_obf_bc}
+  COMMAND $<TARGET_FILE:ollvm-obf>
+    ${_obf_algo_clean_bc}
+    -o ${_obf_algo_obf_bc}
+    ${_ollvm_obf_flags}
+  DEPENDS ${_obf_algo_clean_bc} ollvm-obf
+  COMMENT "Obfuscating obf_algo_funcs.bc with selected OLLVM transforms: ${_ollvm_obf_flags}"
+)
+
+add_custom_command(
+  OUTPUT ${_obf_algo_obf_obj}
+  COMMAND ${CMAKE_CXX_COMPILER} -c -O0
+    -target x86_64-pc-windows-msvc
+    ${_obf_algo_obf_bc}
+    -o ${_obf_algo_obf_obj}
+  DEPENDS ${_obf_algo_obf_bc}
+  COMMENT "Compiling obfuscated algorithm bitcode to object"
+)
+
+set_source_files_properties(
+  ${_obf_algo_obf_obj}
+  PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE
+)
+target_sources(obf_test PRIVATE ${_obf_algo_obf_obj})
+add_dependencies(obf_test ollvm-obf)
+
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc
   COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
@@ -109,6 +155,16 @@ add_custom_command(
     -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs.bc
   DEPENDS src/ollvm_funcs.cpp
   COMMENT "Compiling ollvm_funcs.cpp to bitcode"
+)
+
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix.bc
+  COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
+    -target x86_64-pc-windows-msvc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ollvm_vec_const_mix.cpp
+    -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix.bc
+  DEPENDS src/ollvm_vec_const_mix.cpp
+  COMMENT "Compiling ollvm_vec_const_mix.cpp to bitcode"
 )
 
 # Step 2: obfuscate bitcode with ollvm-obf.
@@ -122,24 +178,57 @@ add_custom_command(
   COMMENT "Obfuscating ollvm_funcs.bc with selected OLLVM transforms: ${_ollvm_obf_flags}"
 )
 
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.bc
+  COMMAND $<TARGET_FILE:ollvm-obf>
+    ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix.bc
+    -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.bc
+    --seed=${OMILL_OLLVM_OBF_SEED}
+    --const-unfold
+    --vectorize
+    --vectorize-percent=100
+    --vectorize-bitwise
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix.bc ollvm-obf
+  COMMENT "Obfuscating ollvm_vec_const_mix.bc with const-unfold + vectorize only"
+)
+
 # Step 3: obfuscated bitcode → object (O0 to prevent LLVM undoing obfuscation).
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
   COMMAND ${CMAKE_CXX_COMPILER} -c -O0
     -target x86_64-pc-windows-msvc
+    -msse4.2
+    -mno-avx
     ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
     -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
   DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc
   COMMENT "Compiling obfuscated bitcode to object"
 )
 
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.obj
+  COMMAND ${CMAKE_CXX_COMPILER} -c -O0
+    -target x86_64-pc-windows-msvc
+    -msse4.2
+    -mno-avx
+    ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.bc
+    -o ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.obj
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.bc
+  COMMENT "Compiling obfuscated vector/const sample to object"
+)
+
 # Step 4: Link DLL from obfuscated object + dllmain.
 add_library(ollvm_test SHARED
   src/dllmain.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
+  ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.obj
 )
 set_source_files_properties(
   ${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.obj
+  PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE
+)
+set_source_files_properties(
+  ${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.obj
   PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE
 )
 set_source_files_properties(src/dllmain.cpp
@@ -149,3 +238,93 @@ target_compile_options(ollvm_test PRIVATE -UUNICODE -U_UNICODE)
 target_link_libraries(ollvm_test PRIVATE kernel32)
 set_target_properties(ollvm_test PROPERTIES PREFIX "" OUTPUT_NAME "ollvm_test")
 add_dependencies(ollvm_test ollvm-obf)
+
+# ==========================================================================
+# Deobfuscation round-trip test DLLs — one DLL per OLLVM pass (+ combined).
+# Pipeline: C++ -> bitcode (-O2) -> ollvm-obf [per-pass] -> obj (-O0) -> DLL
+# ==========================================================================
+
+set(_rt_src "${CMAKE_CURRENT_SOURCE_DIR}/src/deobf_roundtrip_funcs.cpp")
+set(_rt_seed ${OMILL_OLLVM_OBF_SEED})
+
+# Step 1: C++ -> clean bitcode (base for all variants).
+set(_rt_base_bc "${CMAKE_CURRENT_BINARY_DIR}/rt_funcs_base.bc")
+add_custom_command(
+  OUTPUT ${_rt_base_bc}
+  COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
+    -target x86_64-pc-windows-msvc
+    ${_rt_src}
+    -o ${_rt_base_bc}
+  DEPENDS ${_rt_src}
+  COMMENT "[RT] Compiling deobf_roundtrip_funcs.cpp to clean bitcode"
+)
+
+# Helper macro: build one DLL from a single set of ollvm-obf flags.
+# Usage: rt_add_obf_dll(<name> <flag1> [flag2 ...])
+# - For the clean variant, pass CLEAN as the sole flag (no obfuscation).
+macro(rt_add_obf_dll NAME)
+  set(_rt_${NAME}_bc "${CMAKE_CURRENT_BINARY_DIR}/rt_funcs_${NAME}.bc")
+  set(_rt_${NAME}_obj "${CMAKE_CURRENT_BINARY_DIR}/rt_funcs_${NAME}.obj")
+
+  if("${ARGN}" STREQUAL "CLEAN")
+    # No obfuscation — copy clean bitcode directly.
+    add_custom_command(
+      OUTPUT ${_rt_${NAME}_bc}
+      COMMAND ${CMAKE_COMMAND} -E copy ${_rt_base_bc} ${_rt_${NAME}_bc}
+      DEPENDS ${_rt_base_bc}
+      COMMENT "[RT] Copying clean bitcode for rt_${NAME}"
+    )
+  else()
+    add_custom_command(
+      OUTPUT ${_rt_${NAME}_bc}
+      COMMAND $<TARGET_FILE:ollvm-obf>
+        ${_rt_base_bc}
+        -o ${_rt_${NAME}_bc}
+        --seed=${_rt_seed}
+        ${ARGN}
+      DEPENDS ${_rt_base_bc} ollvm-obf
+      COMMENT "[RT] Obfuscating rt_funcs for rt_${NAME}: ${ARGN}"
+    )
+  endif()
+
+  add_custom_command(
+    OUTPUT ${_rt_${NAME}_obj}
+    COMMAND ${CMAKE_CXX_COMPILER} -c -O0
+      -target x86_64-pc-windows-msvc
+      -msse4.2 -mno-avx
+      ${_rt_${NAME}_bc}
+      -o ${_rt_${NAME}_obj}
+    DEPENDS ${_rt_${NAME}_bc}
+    COMMENT "[RT] Compiling rt_${NAME} bitcode to object"
+  )
+
+  set_source_files_properties(
+    ${_rt_${NAME}_obj}
+    PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE
+  )
+
+  add_library(rt_${NAME} SHARED
+    src/dllmain.cpp
+    ${_rt_${NAME}_obj}
+  )
+  set_source_files_properties(src/dllmain.cpp
+    PROPERTIES COMPILE_OPTIONS "-O0"
+  )
+  target_compile_options(rt_${NAME} PRIVATE -UUNICODE -U_UNICODE)
+  target_link_libraries(rt_${NAME} PRIVATE kernel32)
+  set_target_properties(rt_${NAME} PROPERTIES
+    PREFIX "" OUTPUT_NAME "rt_${NAME}"
+  )
+  add_dependencies(rt_${NAME} ollvm-obf)
+endmacro()
+
+# --- Per-pass variants ---
+rt_add_obf_dll(clean           CLEAN)
+rt_add_obf_dll(flatten         --flatten)
+rt_add_obf_dll(substitute      --substitute)
+rt_add_obf_dll(bogus_cf        --bogus-control-flow)
+rt_add_obf_dll(opaque_pred     --opaque-predicates)
+rt_add_obf_dll(const_unfold    --const-unfold)
+rt_add_obf_dll(string_encrypt  --string-encrypt)
+rt_add_obf_dll(vectorize       --vectorize --vectorize-data)
+rt_add_obf_dll(all             ${_ollvm_obf_flags})

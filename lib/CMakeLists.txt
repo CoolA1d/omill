@@ -10,6 +10,7 @@ add_library(omill STATIC
   Analysis/RemillIntrinsicAnalysis.cpp
   Analysis/StateFieldAccessAnalysis.cpp
   Analysis/ExceptionInfo.cpp
+  Analysis/SegmentsAA.cpp
 
   # Passes - Stage 2: Intrinsic Lowering
   Passes/LowerRemillIntrinsics.cpp
@@ -47,6 +48,19 @@ add_library(omill STATIC
   Passes/OutlineConstantStackData.cpp
   Passes/SimplifyVectorReassembly.cpp
   Passes/EliminateDeadPaths.cpp
+  Passes/MemoryCoalesce.cpp
+  Passes/PartialOverlapDSE.cpp
+  Passes/KnownIndexSelect.cpp
+  Passes/PointersHoisting.cpp
+  Passes/JunkInstructionRemover.cpp
+  Passes/JumpTableConcretizer.cpp
+  Passes/IndirectCallResolver.cpp
+  Passes/ControlFlowUnflattener.cpp
+  Passes/SynthesizeFlags.cpp
+  Passes/StackConcretization.cpp
+  Passes/IterativeBlockDiscovery.cpp
+  Passes/MergeBlockFunctions.cpp
+  BC/BlockLifterAnalysis.cpp
   # Pipeline
   Pipeline.cpp
   Passes/PassRegistry.cpp
@@ -95,4 +109,14 @@ else()
   target_compile_options(omill PRIVATE
     /W3 /EHsc /GR-
   )
+endif()
+
+# Ported remill TraceLifter + BlockLifter (only when remill is available)
+if(OMILL_ENABLE_REMILL)
+  target_sources(omill PRIVATE
+    BC/TraceLifter.cpp
+    BC/BlockLifter.cpp
+  )
+  target_link_libraries(omill PRIVATE remill)
+  target_compile_definitions(omill PUBLIC OMILL_ENABLE_REMILL=1)
 endif()

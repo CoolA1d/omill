@@ -7,6 +7,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 
+#include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/CallingConventionAnalysis.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
 #include "omill/Utils/LiftedNames.h"
@@ -43,6 +44,56 @@ void buildStateStore(llvm::IRBuilder<> &Builder, llvm::Value *state_ptr,
   auto *gep = Builder.CreateGEP(Builder.getInt8Ty(), state_ptr,
                                 Builder.getInt64(offset));
   Builder.CreateStore(val, gep);
+}
+
+llvm::Value *normalizeJumpTargetPC(llvm::IRBuilder<> &Builder,
+                                   llvm::Value *target_pc,
+                                   const BinaryMemoryMap *map) {
+  if (!map) {
+    return target_pc;
+  }
+
+  uint64_t image_base = map->imageBase();
+  uint64_t image_size = map->imageSize();
+  if (image_base == 0 || image_size == 0) {
+    return target_pc;
+  }
+
+  auto *i64_ty = Builder.getInt64Ty();
+  auto *i32_ty = Builder.getInt32Ty();
+  auto *base_c = llvm::ConstantInt::get(i64_ty, image_base);
+  auto *size_c = llvm::ConstantInt::get(i64_ty, image_size);
+
+  // Keep already-canonical in-image targets untouched.
+  auto *delta = Builder.CreateSub(target_pc, base_c, "pc.delta");
+  auto *in_image = Builder.CreateICmpULT(delta, size_c, "pc.in_image");
+
+  // Canonicalize RVA-like and +4GB-skewed forms:
+  //   0x1a6a       -> 0x140001a6a
+  //   0x100001a6a  -> 0x140001a6a
+  //   0x240001a6a  -> 0x140001a6a
+  auto *low32 = Builder.CreateZExt(Builder.CreateTrunc(target_pc, i32_ty),
+                                    i64_ty, "pc.low32");
+  auto *low32_in_image =
+      Builder.CreateICmpULT(low32, size_c, "pc.low32_in_image");
+  auto *low32_as_va = Builder.CreateAdd(base_c, low32, "pc.low32_as_va");
+  auto *normalized = Builder.CreateSelect(low32_in_image, low32_as_va, target_pc,
+                                          "pc.norm");
+
+  // Also handle targets already rebased to image_base but skewed by +4GB
+  // in the RVA component, e.g. 0x240001a6a -> 0x140001a6a.
+  auto *as_rva = Builder.CreateSub(target_pc, base_c, "pc.as_rva");
+  auto *as_rva_low32 = Builder.CreateZExt(
+      Builder.CreateTrunc(as_rva, i32_ty), i64_ty, "pc.as_rva_low32");
+  auto *as_rva_low32_in_image =
+      Builder.CreateICmpULT(as_rva_low32, size_c, "pc.as_rva_low32_in_image");
+  auto *as_rva_low32_as_va =
+      Builder.CreateAdd(base_c, as_rva_low32, "pc.as_rva_low32_as_va");
+  normalized = Builder.CreateSelect(as_rva_low32_in_image, as_rva_low32_as_va,
+                                    normalized, "pc.norm.rebased");
+
+  return Builder.CreateSelect(in_image, target_pc, normalized,
+                              "pc.canonical");
 }
 
 // hasLiftedSignature is now in omill/Utils/LiftedNames.h
@@ -176,8 +227,12 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
       // B3: Dynamic target — still rewrite to prevent State escape.
       // Keep unresolved jump dispatches as calls to __omill_dispatch_jump.
       // Rewriting them to inttoptr(target_pc) can call raw binary VAs.
-      if (is_dispatch_jump)
+      if (is_dispatch_jump) {
+        if (F.getName().ends_with("_native")) {
+          candidates.push_back({call, nullptr, call->getArgOperand(0), true});
+        }
         continue;
+      }
 
       candidates.push_back({call, nullptr, call->getArgOperand(0), false});
     }
@@ -190,6 +245,7 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
   auto &cc_info = MAM.getResult<CallingConventionAnalysis>(M);
   auto &lifted = MAM.getResult<LiftedFunctionAnalysis>(M);
+  auto &mem_map = MAM.getResult<BinaryMemoryAnalysis>(M);
 
   // Pre-compute leaf status for all lifted functions before any mutations.
   // This prevents isLeafLifted from returning stale results after dispatch
@@ -256,35 +312,50 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
                           result);
         }
       } else {
-        // Dynamic target: emit an indirect call through the computed PC.
+        // Dynamic dispatch_call target: emit an indirect call through target PC.
+        // Dynamic dispatch_jump in _native wrappers: materialize RAX only.
         llvm::IRBuilder<> Builder(cand.call);
         auto *i64_ty = Builder.getInt64Ty();
-        auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
-
         auto *target_pc = cand.call->getArgOperand(1);
-        auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");
 
-        auto *rcx =
-            buildStateLoad(Builder, cand.state_ptr, kRCXOffset, "rcx");
-        auto *rdx =
-            buildStateLoad(Builder, cand.state_ptr, kRDXOffset, "rdx");
-        auto *r8 =
-            buildStateLoad(Builder, cand.state_ptr, kR8Offset, "r8");
-        auto *r9 =
-            buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
+        if (cand.is_dispatch_jump) {
+          if (!target_pc->getType()->isIntegerTy(64)) {
+            if (target_pc->getType()->isPointerTy()) {
+              target_pc = Builder.CreatePtrToInt(target_pc, i64_ty, "jump.pc");
+            } else if (target_pc->getType()->isIntegerTy()) {
+              target_pc = Builder.CreateZExtOrTrunc(target_pc, i64_ty, "jump.pc");
+            } else {
+              target_pc = llvm::PoisonValue::get(i64_ty);
+            }
+          }
+          target_pc = normalizeJumpTargetPC(Builder, target_pc, &mem_map);
+          buildStateStore(Builder, cand.state_ptr, kRAXOffset, target_pc);
+        } else {
+          auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
+          auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");
 
-        auto *fn_ty = llvm::FunctionType::get(
-            i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
+          auto *rcx =
+              buildStateLoad(Builder, cand.state_ptr, kRCXOffset, "rcx");
+          auto *rdx =
+              buildStateLoad(Builder, cand.state_ptr, kRDXOffset, "rdx");
+          auto *r8 =
+              buildStateLoad(Builder, cand.state_ptr, kR8Offset, "r8");
+          auto *r9 =
+              buildStateLoad(Builder, cand.state_ptr, kR9Offset, "r9");
 
-        auto *result = Builder.CreateCall(fn_ty, fn_ptr,
-                                          {rcx, rdx, r8, r9},
-                                          "indirect.result");
-        // This call is not structurally in tail position in many lifted
-        // functions, so using musttail here can produce invalid IR.
-        llvm::cast<llvm::CallInst>(result)->setTailCallKind(
-            llvm::CallInst::TCK_Tail);
+          auto *fn_ty = llvm::FunctionType::get(
+              i64_ty, {i64_ty, i64_ty, i64_ty, i64_ty}, false);
 
-        buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
+          auto *result = Builder.CreateCall(fn_ty, fn_ptr,
+                                            {rcx, rdx, r8, r9},
+                                            "indirect.result");
+          // This call is not structurally in tail position in many lifted
+          // functions, so using musttail here can produce invalid IR.
+          llvm::cast<llvm::CallInst>(result)->setTailCallKind(
+              llvm::CallInst::TCK_Tail);
+
+          buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
+        }
       }
 
       if (!cand.call->getType()->isVoidTy()) {

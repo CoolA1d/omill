@@ -73,6 +73,19 @@ add_executable(omill-unit-tests
   unit/FoldConstantVectorChainsTest.cpp
   unit/DeadStateRoundtripEliminationTest.cpp
   unit/EliminateRedundantByteStoresTest.cpp
+  unit/MemoryCoalesceTest.cpp
+  unit/PartialOverlapDSETest.cpp
+  unit/KnownIndexSelectTest.cpp
+  unit/PointersHoistingTest.cpp
+  unit/JunkInstructionRemoverTest.cpp
+  unit/IterativeBlockDiscoveryTest.cpp
+  unit/MergeBlockFunctionsTest.cpp
+  unit/JumpTableConcretizerTest.cpp
+  unit/IndirectCallResolverTest.cpp
+  unit/ControlFlowUnflattenerTest.cpp
+  unit/SynthesizeFlagsTest.cpp
+  unit/SegmentsAATest.cpp
+  unit/StackConcretizationTest.cpp
 )
 
 target_link_libraries(omill-unit-tests
@@ -163,6 +176,9 @@ if(OMILL_ENABLE_TOOLS)
   set(_ollvm_src "${CMAKE_CURRENT_SOURCE_DIR}/../test_obf/src/ollvm_funcs.cpp")
   set(_ollvm_clean_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_clean.bc")
   set(_ollvm_obf_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_funcs_obf.bc")
+  set(_ollvm_mix_src "${CMAKE_CURRENT_SOURCE_DIR}/../test_obf/src/ollvm_vec_const_mix.cpp")
+  set(_ollvm_mix_clean_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_clean.bc")
+  set(_ollvm_mix_obf_bc "${CMAKE_CURRENT_BINARY_DIR}/ollvm_vec_const_mix_obf.bc")
 
   # Step 1: C++ → clean bitcode at -O2.
   add_custom_command(
@@ -186,9 +202,35 @@ if(OMILL_ENABLE_TOOLS)
     COMMENT "Obfuscating ollvm_funcs.bc with selected OLLVM transforms: ${_ollvm_obf_flags}"
   )
 
+  # Dedicated sample: only vectorization + constant unfolding.
+  add_custom_command(
+    OUTPUT ${_ollvm_mix_clean_bc}
+    COMMAND ${CMAKE_CXX_COMPILER} -c -emit-llvm -O2
+      -target x86_64-pc-windows-msvc
+      ${_ollvm_mix_src}
+      -o ${_ollvm_mix_clean_bc}
+    DEPENDS ${_ollvm_mix_src}
+    COMMENT "Compiling ollvm_vec_const_mix.cpp to clean bitcode"
+  )
+
+  add_custom_command(
+    OUTPUT ${_ollvm_mix_obf_bc}
+    COMMAND $<TARGET_FILE:ollvm-obf>
+      ${_ollvm_mix_clean_bc}
+      -o ${_ollvm_mix_obf_bc}
+      --seed=${OMILL_OLLVM_OBF_SEED}
+      --const-unfold
+      --vectorize
+      --vectorize-percent=100
+      --vectorize-bitwise
+    DEPENDS ${_ollvm_mix_clean_bc} ollvm-obf
+    COMMENT "Obfuscating ollvm_vec_const_mix.bc with const-unfold + vectorize only"
+  )
+
   # Custom target so the test binary depends on the .bc files.
   add_custom_target(ollvm_jit_bitcode
     DEPENDS ${_ollvm_clean_bc} ${_ollvm_obf_bc}
+            ${_ollvm_mix_clean_bc} ${_ollvm_mix_obf_bc}
   )
 
   add_executable(omill-ollvm-jit-tests
@@ -200,6 +242,8 @@ if(OMILL_ENABLE_TOOLS)
   target_compile_definitions(omill-ollvm-jit-tests PRIVATE
     OLLVM_CLEAN_BC_PATH="${_ollvm_clean_bc}"
     OLLVM_OBF_BC_PATH="${_ollvm_obf_bc}"
+    OLLVM_VEC_CONST_CLEAN_BC_PATH="${_ollvm_mix_clean_bc}"
+    OLLVM_VEC_CONST_OBF_BC_PATH="${_ollvm_mix_obf_bc}"
   )
 
   target_link_libraries(omill-ollvm-jit-tests
@@ -215,6 +259,30 @@ if(OMILL_ENABLE_TOOLS)
   gtest_discover_tests(omill-ollvm-jit-tests
     PROPERTIES TIMEOUT 30
   )
+
+  # OLLVM obfuscation pass unit tests (compile pass sources directly).
+  add_executable(omill-ollvm-obf-unit-tests
+    unit/OpaquePredicatesObfTest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ollvm-obf/OpaquePredicates.cpp
+  )
+
+  target_include_directories(omill-ollvm-obf-unit-tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../tools/ollvm-obf
+  )
+
+  target_link_libraries(omill-ollvm-obf-unit-tests
+    PRIVATE
+      GTest::gtest_main
+      ${OMILL_LLVM_LIBS}
+  )
+
+  if(NOT MSVC)
+    target_compile_options(omill-ollvm-obf-unit-tests PRIVATE -fno-rtti)
+  endif()
+
+  gtest_discover_tests(omill-ollvm-obf-unit-tests
+    PROPERTIES TIMEOUT 30
+  )
 endif()
 
 # E2E tests (require remill + Zydis)
@@ -225,19 +293,34 @@ if(OMILL_ENABLE_REMILL)
     e2e/OpaquePredicateTest.cpp
     e2e/ControlFlowFlatteningTest.cpp
     e2e/DeobfuscationTest.cpp
+    e2e/OLLVMObfAlgorithmsTest.cpp
     e2e/HyperCallRoundTripTest.cpp
     e2e/ForcedExceptionTest.cpp
     e2e/OLLVMTest.cpp
+    e2e/BlockLifterTest.cpp
+    e2e/DeobfuscationRoundTripTest.cpp
   )
 
   # Pass DLL paths to the deobfuscation tests.
   target_compile_definitions(omill-e2e-tests PRIVATE
     OBF_TEST_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/obf_test.dll"
     OLLVM_TEST_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/ollvm_test.dll"
+    RT_CLEAN_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_clean.dll"
+    RT_FLATTEN_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_flatten.dll"
+    RT_SUBSTITUTE_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_substitute.dll"
+    RT_BOGUS_CF_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_bogus_cf.dll"
+    RT_OPAQUE_PRED_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_opaque_pred.dll"
+    RT_CONST_UNFOLD_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_const_unfold.dll"
+    RT_STRING_ENCRYPT_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_string_encrypt.dll"
+    RT_VECTORIZE_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_vectorize.dll"
+    RT_ALL_DLL_PATH="${CMAKE_BINARY_DIR}/test_obf/rt_all.dll"
   )
 
   # Ensure DLLs are built before the tests.
-  add_dependencies(omill-e2e-tests obf_test ollvm_test)
+  add_dependencies(omill-e2e-tests obf_test ollvm_test
+    rt_clean rt_flatten rt_substitute rt_bogus_cf rt_opaque_pred
+    rt_const_unfold rt_string_encrypt rt_vectorize rt_all
+  )
 
   target_link_libraries(omill-e2e-tests
     PRIVATE

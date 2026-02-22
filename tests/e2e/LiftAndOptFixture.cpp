@@ -152,7 +152,7 @@ llvm::Module *LiftAndOptFixture::lift() {
   if (!module_) return nullptr;
 
   // Lift traces starting from the base address.
-  remill::TraceLifter lifter(arch_.get(), manager_);
+  omill::TraceLifter lifter(arch_.get(), manager_);
   bool ok = lifter.Lift(manager_.baseAddr());
   EXPECT_TRUE(ok) << "TraceLifter::Lift() failed";
 
@@ -164,7 +164,7 @@ llvm::Module *LiftAndOptFixture::liftMultiple(llvm::ArrayRef<uint64_t> addrs) {
   EXPECT_NE(module_, nullptr) << "Failed to load arch semantics";
   if (!module_) return nullptr;
 
-  remill::TraceLifter lifter(arch_.get(), manager_);
+  omill::TraceLifter lifter(arch_.get(), manager_);
   for (uint64_t addr : addrs) {
     bool ok = lifter.Lift(addr);
     EXPECT_TRUE(ok) << "TraceLifter::Lift() failed for 0x" << std::hex << addr;

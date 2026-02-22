@@ -1,11 +1,13 @@
 #include "LiftAndOptFixture.h"
 #include "PELoader.h"
 
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 
 #ifndef OBF_TEST_DLL_PATH
@@ -59,8 +61,15 @@ class DeobfuscationTest : public LiftAndOptFixture {
     uint64_t va = getExportVA(export_name);
     if (va == 0) return false;
 
+    current_export_va_ = va;
+    expected_native_prefix_.clear();
+
     auto *M = liftExport(va);
     if (!M) return false;
+    auto trace_it = traceManager().traces().find(va);
+    if (trace_it != traceManager().traces().end() && trace_it->second) {
+      expected_native_prefix_ = trace_it->second->getName().str();
+    }
 
     omill::PipelineOptions opts;
     opts.recover_abi = true;
@@ -238,6 +247,83 @@ class DeobfuscationTest : public LiftAndOptFixture {
     return n;
   }
 
+  static std::optional<uint64_t> parseNativeVA(llvm::StringRef name) {
+    if (!name.starts_with("sub_") || !name.contains("_native"))
+      return std::nullopt;
+
+    llvm::StringRef core = name.drop_front(4);
+    size_t hex_len = 0;
+    while (hex_len < core.size() && llvm::isHexDigit(core[hex_len]))
+      ++hex_len;
+    if (hex_len == 0)
+      return std::nullopt;
+
+    uint64_t va = 0;
+    if (core.take_front(hex_len).getAsInteger(16, va))
+      return std::nullopt;
+    return va;
+  }
+
+  llvm::Function *findNativeForCurrentExport() {
+    if (!module() || current_export_va_ == 0)
+      return nullptr;
+
+    if (!expected_native_prefix_.empty()) {
+      std::string exact_name = expected_native_prefix_ + "_native";
+      if (auto *F = module()->getFunction(exact_name)) {
+        if (!F->isDeclaration())
+          return F;
+      }
+      for (auto &F : *module()) {
+        if (F.isDeclaration() || !F.getName().contains("_native"))
+          continue;
+        if (F.getName().starts_with(expected_native_prefix_))
+          return &F;
+      }
+    }
+
+    llvm::Function *nearest = nullptr;
+    uint64_t nearest_dist = UINT64_MAX;
+    for (auto &F : *module()) {
+      if (F.isDeclaration() || !F.getName().contains("_native"))
+        continue;
+      auto va = parseNativeVA(F.getName());
+      if (!va)
+        continue;
+      if (*va == current_export_va_)
+        return &F;
+      uint64_t dist = (*va > current_export_va_) ? (*va - current_export_va_)
+                                                 : (current_export_va_ - *va);
+      if (dist < nearest_dist) {
+        nearest_dist = dist;
+        nearest = &F;
+      }
+    }
+    if (nearest && nearest_dist <= 0x400)
+      return nearest;
+    return nullptr;
+  }
+
+  llvm::Function *findNativeFunction() {
+    if (current_export_va_ != 0) {
+      return findNativeForCurrentExport();
+    }
+    for (auto &F : *module())
+      if (!F.isDeclaration() && F.getName().contains("_native"))
+        return &F;
+    return nullptr;
+  }
+
+  unsigned countTargetNativeInstructions() {
+    auto *F = findNativeFunction();
+    if (!F)
+      return 0;
+    unsigned n = 0;
+    for (auto &BB : *F)
+      n += BB.size();
+    return n;
+  }
+
   /// Check if a dllimport function is actually called (not just declared).
   bool isDllImportCalled(llvm::StringRef name) {
     auto *fn = module()->getFunction(name);
@@ -250,6 +336,8 @@ class DeobfuscationTest : public LiftAndOptFixture {
   }
 
   std::vector<uint8_t> text_copy_;
+  uint64_t current_export_va_ = 0;
+  std::string expected_native_prefix_;
 
   PEInfo pe_;
 };
@@ -487,6 +575,42 @@ TEST_F(DeobfuscationTest, MixedSingleNativeFunction) {
 
   // obf_mixed_resolve is self-contained — should produce exactly 1 function.
   EXPECT_EQ(countNativeFunctions(), 1u);
+}
+
+// =============================================================================
+// OLLVM-obfuscated algorithm exports in obf_test.dll
+// =============================================================================
+
+TEST_F(DeobfuscationTest, ObfAlgoCRC32Recovery) {
+  ASSERT_TRUE(liftAndOptimize("obf_algo_crc32"));
+  ASSERT_TRUE(verifyModule()) << "Module invalid after optimization";
+
+  auto *NF = findNativeFunction();
+  ASSERT_NE(NF, nullptr) << "Expected recovered native function for obf_algo_crc32";
+  EXPECT_EQ(NF->arg_size(), 2u)
+      << "Expected CRC32 ABI to recover 2 params (ptr, len)";
+  EXPECT_TRUE(NF->getReturnType()->isIntegerTy(64))
+      << "Expected i64 return type (RAX)";
+
+  EXPECT_LT(countTargetNativeInstructions(), 2500u)
+      << "Expected CRC32 to be reasonably recovered";
+}
+
+TEST_F(DeobfuscationTest, ObfAlgoSHA256Recovery) {
+  ASSERT_TRUE(liftAndOptimize("obf_algo_sha256"));
+  ASSERT_TRUE(verifyModule()) << "Module invalid after optimization";
+
+  auto *NF = findNativeFunction();
+  ASSERT_NE(NF, nullptr) << "Expected recovered native function for obf_algo_sha256";
+  EXPECT_GE(NF->arg_size(), 3u)
+      << "Expected SHA256 ABI to recover at least 3 params";
+  EXPECT_LE(NF->arg_size(), 4u)
+      << "Expected SHA256 ABI to recover at most 4 params";
+  EXPECT_TRUE(NF->getReturnType()->isIntegerTy(64))
+      << "Expected i64 return type (RAX)";
+
+  EXPECT_LT(countTargetNativeInstructions(), 18000u)
+      << "Expected SHA256 to be reasonably recovered";
 }
 
 // =============================================================================

@@ -14,6 +14,7 @@
 #include "omill/Passes/EliminateDeadPaths.h"
 #include "omill/Passes/LowerRemillIntrinsics.h"
 #include "omill/Passes/ResolveAndLowerControlFlow.h"
+#include "omill/Passes/IndirectCallResolver.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
 #endif
@@ -76,6 +77,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(ResolveAndLowerControlFlowPass());
+      FPM.addPass(IndirectCallResolverPass());
 #if OMILL_ENABLE_Z3
       FPM.addPass(Z3DispatchSolverPass());
 #endif

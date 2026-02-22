@@ -12,8 +12,10 @@
 
 #include <cstdint>
 
+#include "BogusControlFlow.h"
 #include "ConstantUnfolding.h"
 #include "Flattening.h"
+#include "OpaquePredicates.h"
 #include "StringEncryption.h"
 #include "Substitution.h"
 #include "Vectorize.h"
@@ -43,6 +45,14 @@ static cl::opt<bool> DoStringEncrypt("string-encrypt",
 static cl::opt<bool> DoConstUnfold("const-unfold",
                                     cl::desc("Replace constants with equivalent expressions"),
                                     cl::init(false));
+
+static cl::opt<bool> DoOpaquePredicates("opaque-predicates",
+                                         cl::desc("Insert opaque predicates"),
+                                         cl::init(false));
+
+static cl::opt<bool> DoBogusControlFlow("bogus-control-flow",
+                                         cl::desc("Insert bogus control flow"),
+                                         cl::init(false));
 
 static cl::opt<bool> DoVectorize("vectorize",
                                   cl::desc("Replace i32 scalar ops with SSE vector ops"),
@@ -112,6 +122,14 @@ int main(int argc, char **argv) {
 
   if (DoFlatten) {
     ollvm::flattenModule(*M, mixSeed(base_seed, 0xA1F3707Bu));
+  }
+
+  if (DoOpaquePredicates) {
+    ollvm::insertOpaquePredicatesModule(*M, mixSeed(base_seed, 0xE4D29B13u));
+  }
+
+  if (DoBogusControlFlow) {
+    ollvm::insertBogusControlFlowModule(*M, mixSeed(base_seed, 0x7F1A83C5u));
   }
 
   if (DoConstUnfold) {

@@ -13,6 +13,7 @@
 #include "omill/Analysis/LiftedFunctionMap.h"
 
 #include <gtest/gtest.h>
+#include <optional>
 
 namespace {
 
@@ -210,6 +211,63 @@ TEST_F(ResolveForcedExceptionsTest, MultipleErrorCallsResolved) {
   // At least one handler call (the second error call may be erased as dead code
   // after the first error→ret transformation).
   EXPECT_GE(handler_count, 1u);
+}
+
+TEST_F(ResolveForcedExceptionsTest, SeedsExpectedStateRegistersOnly) {
+  auto [M, test_fn, handler_fn, error_fn] = createTestModule(true, 1);
+
+  runPassWithExceptionInfo(*test_fn, true);
+
+  auto getStateOffset = [](llvm::Value *ptr) -> std::optional<uint64_t> {
+    auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr);
+    if (!gep || gep->getNumIndices() != 1)
+      return std::nullopt;
+    auto *idx = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1));
+    if (!idx)
+      return std::nullopt;
+    return idx->getZExtValue();
+  };
+
+  // Win64 State byte offsets used by the pass.
+  static constexpr uint64_t kRCXOffset = 2248;
+  static constexpr uint64_t kRDXOffset = 2264;
+  static constexpr uint64_t kR8Offset = 2344;
+  static constexpr uint64_t kR9Offset = 2360;
+
+  bool saw_rdx_seed = false;
+  bool saw_r8_seed = false;
+  bool saw_r9_seed = false;
+  bool saw_rcx_clobber = false;
+
+  for (auto &BB : *test_fn) {
+    for (auto &I : BB) {
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+      if (!SI)
+        continue;
+      auto off = getStateOffset(SI->getPointerOperand());
+      if (!off.has_value())
+        continue;
+
+      auto *val_ci = llvm::dyn_cast<llvm::ConstantInt>(SI->getValueOperand());
+      if (!val_ci)
+        continue;
+      uint64_t v = val_ci->getZExtValue();
+
+      if (*off == kRDXOffset && v == 0x401000)
+        saw_rdx_seed = true;      // begin_va
+      if (*off == kR9Offset && v == 0x500000)
+        saw_r9_seed = true;       // synthetic DC in test setup
+      if (*off == kRCXOffset)
+        saw_rcx_clobber = true;
+      if (*off == kR8Offset && v == 0x600000)
+        saw_r8_seed = true;       // ctx_synthetic_va
+    }
+  }
+
+  EXPECT_TRUE(saw_rdx_seed);
+  EXPECT_TRUE(saw_r8_seed);
+  EXPECT_TRUE(saw_r9_seed);
+  EXPECT_FALSE(saw_rcx_clobber);
 }
 
 }  // namespace
