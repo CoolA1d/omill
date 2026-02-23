@@ -867,6 +867,9 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(IndirectCallResolverPass());
+#if OMILL_ENABLE_Z3
+    FPM.addPass(Z3DispatchSolverPass());
+#endif
     FPM.addPass(ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
     FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));

@@ -15,8 +15,6 @@
 
 #define DEBUG_TYPE "optimize-state"
 
-using namespace llvm;
-
 namespace omill {
 
 namespace {
@@ -25,13 +23,13 @@ namespace {
 // Shared utility
 // ============================================================================
 
-int64_t resolveStateOffset(Value *ptr, const DataLayout &DL) {
+int64_t resolveStateOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
   int64_t total_offset = 0;
-  Value *base = ptr;
+  llvm::Value *base = ptr;
 
   while (true) {
-    if (auto *GEP = dyn_cast<GEPOperator>(base)) {
-      APInt ap_offset(64, 0);
+    if (auto *GEP = llvm::dyn_cast<llvm::GEPOperator>(base)) {
+      llvm::APInt ap_offset(64, 0);
       if (GEP->accumulateConstantOffset(DL, ap_offset)) {
         total_offset += ap_offset.getSExtValue();
         base = GEP->getPointerOperand();
@@ -39,14 +37,14 @@ int64_t resolveStateOffset(Value *ptr, const DataLayout &DL) {
       }
       return -1;
     }
-    if (auto *BC = dyn_cast<BitCastOperator>(base)) {
+    if (auto *BC = llvm::dyn_cast<llvm::BitCastOperator>(base)) {
       base = BC->getOperand(0);
       continue;
     }
     break;
   }
 
-  if (auto *arg = dyn_cast<Argument>(base)) {
+  if (auto *arg = llvm::dyn_cast<llvm::Argument>(base)) {
     if (arg->getArgNo() == 0 && total_offset >= 0) {
       return total_offset;
     }
@@ -58,15 +56,16 @@ int64_t resolveStateOffset(Value *ptr, const DataLayout &DL) {
 // Phase 1: DeadStateFlagElimination
 // ============================================================================
 
-static bool eliminateDeadFlagStores(Function &F, const DataLayout &DL,
+static bool eliminateDeadFlagStores(llvm::Function &F,
+                                     const llvm::DataLayout &DL,
                                      const StateFieldMap &field_map) {
-  SmallVector<Instruction *, 16> dead_stores;
+  llvm::SmallVector<llvm::Instruction *, 16> dead_stores;
 
   for (auto &BB : F) {
-    DenseMap<unsigned, StoreInst *> last_store;
+    llvm::DenseMap<unsigned, llvm::StoreInst *> last_store;
 
     for (auto &I : BB) {
-      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
         int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
         if (off >= 0) {
           auto field = field_map.fieldAtOffset(static_cast<unsigned>(off));
@@ -76,7 +75,7 @@ static bool eliminateDeadFlagStores(Function &F, const DataLayout &DL,
         continue;
       }
 
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
         if (off >= 0) {
           auto field = field_map.fieldAtOffset(static_cast<unsigned>(off));
@@ -92,7 +91,7 @@ static bool eliminateDeadFlagStores(Function &F, const DataLayout &DL,
         continue;
       }
 
-      if (isa<CallInst>(&I) && !isa<IntrinsicInst>(&I)) {
+      if (llvm::isa<llvm::CallInst>(&I) && !llvm::isa<llvm::IntrinsicInst>(&I)) {
         last_store.clear();
       }
     }
@@ -108,20 +107,21 @@ static bool eliminateDeadFlagStores(Function &F, const DataLayout &DL,
 // Phase 2: DeadStateStoreElimination
 // ============================================================================
 
-static bool eliminateDeadStateStores(Function &F, const DataLayout &DL) {
-  SmallVector<Instruction *, 32> dead_stores;
+static bool eliminateDeadStateStores(llvm::Function &F,
+                                      const llvm::DataLayout &DL) {
+  llvm::SmallVector<llvm::Instruction *, 32> dead_stores;
 
   for (auto &BB : F) {
-    DenseMap<unsigned, StoreInst *> last_store;
+    llvm::DenseMap<unsigned, llvm::StoreInst *> last_store;
 
     for (auto &I : BB) {
-      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
         int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
         if (off >= 0)
           last_store.erase(static_cast<unsigned>(off));
       }
 
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
         if (off >= 0) {
           unsigned u_off = static_cast<unsigned>(off);
@@ -132,8 +132,8 @@ static bool eliminateDeadStateStores(Function &F, const DataLayout &DL) {
         }
       }
 
-      if (auto *CI = dyn_cast<CallInst>(&I)) {
-        if (!CI->isInlineAsm() && !isa<IntrinsicInst>(CI))
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
+        if (!CI->isInlineAsm() && !llvm::isa<llvm::IntrinsicInst>(CI))
           last_store.clear();
       }
     }
@@ -149,10 +149,11 @@ static bool eliminateDeadStateStores(Function &F, const DataLayout &DL) {
 // Phase 3: EliminateRedundantByteStores
 // ============================================================================
 
-static bool getBaseAndOffset(Value *ptr, Value *&base, uint64_t &offset) {
-  if (auto *GEP = dyn_cast<GetElementPtrInst>(ptr)) {
+static bool getBaseAndOffset(llvm::Value *ptr, llvm::Value *&base,
+                              uint64_t &offset) {
+  if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr)) {
     if (GEP->getNumIndices() == 1) {
-      if (auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
+      if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1))) {
         base = GEP->getPointerOperand();
         offset = CI->getZExtValue();
         return true;
@@ -164,32 +165,32 @@ static bool getBaseAndOffset(Value *ptr, Value *&base, uint64_t &offset) {
   return true;
 }
 
-static bool getConstantByte(Constant *C, const DataLayout &DL,
+static bool getConstantByte(llvm::Constant *C, const llvm::DataLayout &DL,
                              unsigned byte_offset, uint8_t &out) {
-  Type *ty = C->getType();
+  llvm::Type *ty = C->getType();
   unsigned total_bytes = DL.getTypeStoreSize(ty);
   if (byte_offset >= total_bytes)
     return false;
 
-  if (auto *CI = dyn_cast<ConstantInt>(C)) {
-    APInt val = CI->getValue();
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(C)) {
+    llvm::APInt val = CI->getValue();
     out = val.extractBits(8, byte_offset * 8).getZExtValue();
     return true;
   }
 
-  if (auto *CDV = dyn_cast<ConstantDataVector>(C)) {
+  if (auto *CDV = llvm::dyn_cast<llvm::ConstantDataVector>(C)) {
     unsigned elem_size = DL.getTypeStoreSize(CDV->getElementType());
     unsigned elem_idx = byte_offset / elem_size;
     unsigned byte_in_elem = byte_offset % elem_size;
-    if (auto *elem_ci = dyn_cast<ConstantInt>(CDV->getElementAsConstant(elem_idx))) {
-      APInt val = elem_ci->getValue();
+    if (auto *elem_ci = llvm::dyn_cast<llvm::ConstantInt>(CDV->getElementAsConstant(elem_idx))) {
+      llvm::APInt val = elem_ci->getValue();
       out = val.extractBits(8, byte_in_elem * 8).getZExtValue();
       return true;
     }
     return false;
   }
 
-  if (isa<ConstantAggregateZero>(C)) {
+  if (llvm::isa<llvm::ConstantAggregateZero>(C)) {
     out = 0;
     return true;
   }
@@ -197,31 +198,32 @@ static bool getConstantByte(Constant *C, const DataLayout &DL,
   return false;
 }
 
-static bool eliminateRedundantByteStores(Function &F, const DataLayout &DL) {
+static bool eliminateRedundantByteStores(llvm::Function &F,
+                                          const llvm::DataLayout &DL) {
   bool changed = false;
 
   for (auto &BB : F) {
     struct WideStore {
-      Value *base;
+      llvm::Value *base;
       uint64_t offset;
-      Constant *value;
+      llvm::Constant *value;
       unsigned size;
     };
-    SmallVector<WideStore, 16> wide_stores;
-    SmallVector<StoreInst *, 16> dead_stores;
+    llvm::SmallVector<WideStore, 16> wide_stores;
+    llvm::SmallVector<llvm::StoreInst *, 16> dead_stores;
 
     for (auto &I : BB) {
-      auto *SI = dyn_cast<StoreInst>(&I);
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
       if (!SI) continue;
 
-      Value *base = nullptr;
+      llvm::Value *base = nullptr;
       uint64_t offset = 0;
       if (!getBaseAndOffset(SI->getPointerOperand(), base, offset))
         continue;
 
       unsigned store_size = DL.getTypeStoreSize(SI->getValueOperand()->getType());
 
-      if (auto *C = dyn_cast<Constant>(SI->getValueOperand())) {
+      if (auto *C = llvm::dyn_cast<llvm::Constant>(SI->getValueOperand())) {
         if (store_size > 1) {
           wide_stores.erase(
               std::remove_if(wide_stores.begin(), wide_stores.end(),
@@ -236,7 +238,7 @@ static bool eliminateRedundantByteStores(Function &F, const DataLayout &DL) {
         }
 
         if (store_size == 1) {
-          auto *narrow_ci = dyn_cast<ConstantInt>(C);
+          auto *narrow_ci = llvm::dyn_cast<llvm::ConstantInt>(C);
           if (!narrow_ci) continue;
           uint8_t narrow_val = narrow_ci->getZExtValue() & 0xFF;
 
@@ -278,18 +280,19 @@ static bool eliminateRedundantByteStores(Function &F, const DataLayout &DL) {
 // Phase 4: PromoteStateToSSA
 // ============================================================================
 
-static Value *buildStateFieldGEP(IRBuilder<> &Builder, Value *state_ptr,
-                                  unsigned offset, Type *field_type,
-                                  const DataLayout &DL) {
+static llvm::Value *buildStateFieldGEP(llvm::IRBuilder<> &Builder,
+                                        llvm::Value *state_ptr,
+                                        unsigned offset, llvm::Type *field_type,
+                                        const llvm::DataLayout &DL) {
   auto *i8_ptr = Builder.CreateBitCast(state_ptr, Builder.getPtrTy());
   auto *gep = Builder.CreateConstGEP1_64(Builder.getInt8Ty(), i8_ptr, offset);
   return gep;
 }
 
-static bool hasRemillControlTransfer(const Function &F) {
+static bool hasRemillControlTransfer(const llvm::Function &F) {
   for (const auto &BB : F) {
     for (const auto &I : BB) {
-      auto *CI = dyn_cast<CallInst>(&I);
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
       if (!CI)
         continue;
       auto *callee = CI->getCalledFunction();
@@ -316,8 +319,8 @@ static bool hasRemillControlTransfer(const Function &F) {
   return false;
 }
 
-static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
-  Value *state_ptr = (F.arg_size() > 0) ? F.getArg(0) : nullptr;
+static bool promoteStateToSSA(llvm::Function &F, const llvm::DataLayout &DL) {
+  llvm::Value *state_ptr = (F.arg_size() > 0) ? F.getArg(0) : nullptr;
   if (!state_ptr)
     return false;
 
@@ -330,17 +333,17 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
 
   struct FieldInfo {
     unsigned offset;
-    Type *type;
+    llvm::Type *type;
     unsigned max_access_size = 0;
-    SmallVector<LoadInst *, 4> loads;
-    SmallVector<StoreInst *, 4> stores;
+    llvm::SmallVector<llvm::LoadInst *, 4> loads;
+    llvm::SmallVector<llvm::StoreInst *, 4> stores;
     bool is_live_in = false;
   };
 
-  DenseMap<unsigned, FieldInfo> fields;
+  llvm::DenseMap<unsigned, FieldInfo> fields;
   for (auto &BB : F) {
     for (auto &I : BB) {
-      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
         int64_t off = resolveStateOffset(LI->getPointerOperand(), DL);
         if (off < 0) continue;
         unsigned u_off = static_cast<unsigned>(off);
@@ -354,7 +357,7 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
         info.loads.push_back(LI);
       }
 
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
         int64_t off = resolveStateOffset(SI->getPointerOperand(), DL);
         if (off < 0) continue;
         unsigned u_off = static_cast<unsigned>(off);
@@ -382,8 +385,8 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
   }
 
   // Phase 2: Create allocas
-  IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
-  DenseMap<unsigned, AllocaInst *> field_allocas;
+  llvm::IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
+  llvm::DenseMap<unsigned, llvm::AllocaInst *> field_allocas;
 
   for (auto &[offset, info] : fields) {
     auto *alloca = EntryBuilder.CreateAlloca(info.type, nullptr,
@@ -391,7 +394,7 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
     field_allocas[offset] = alloca;
 
     if (info.is_live_in) {
-      IRBuilder<> Builder(alloca->getNextNode());
+      llvm::IRBuilder<> Builder(alloca->getNextNode());
       auto *gep = buildStateFieldGEP(Builder, state_ptr, offset,
                                       info.type, DL);
       auto *initial = Builder.CreateLoad(info.type, gep, "state_init");
@@ -404,14 +407,14 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
     auto *alloca = field_allocas[offset];
 
     for (auto *LI : info.loads) {
-      IRBuilder<> Builder(LI);
+      llvm::IRBuilder<> Builder(LI);
       auto *new_load = Builder.CreateLoad(LI->getType(), alloca);
       LI->replaceAllUsesWith(new_load);
       LI->eraseFromParent();
     }
 
     for (auto *SI : info.stores) {
-      IRBuilder<> Builder(SI);
+      llvm::IRBuilder<> Builder(SI);
       auto *val = SI->getValueOperand();
       Builder.CreateStore(val, alloca);
 
@@ -435,7 +438,7 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
   // Phase 3.5: Flush/reload around calls that take State
   for (auto &BB : F) {
     for (auto &I : BB) {
-      auto *CI = dyn_cast<CallInst>(&I);
+      auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
       if (!CI) continue;
       bool takes_state = false;
       for (auto &arg : CI->args()) {
@@ -444,7 +447,7 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
       if (!takes_state) continue;
 
       {
-        IRBuilder<> Builder(CI);
+        llvm::IRBuilder<> Builder(CI);
         for (auto &[offset, info] : fields) {
           if (info.stores.empty()) continue;
           auto *alloca = field_allocas[offset];
@@ -456,7 +459,7 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
       }
 
       {
-        IRBuilder<> Builder(CI->getNextNode());
+        llvm::IRBuilder<> Builder(CI->getNextNode());
         for (auto &[offset, info] : fields) {
           auto *alloca = field_allocas[offset];
           auto *gep = buildStateFieldGEP(Builder, state_ptr, offset,
@@ -473,23 +476,23 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
     auto *term = BB.getTerminator();
     if (!term) continue;
 
-    bool is_exit = isa<ReturnInst>(term);
+    bool is_exit = llvm::isa<llvm::ReturnInst>(term);
     if (!is_exit) {
-      if (auto *CI = dyn_cast<CallInst>(BB.getTerminator()->getPrevNode())) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(BB.getTerminator()->getPrevNode())) {
         if (CI->isTailCall() || CI->isMustTailCall())
           is_exit = true;
       }
     }
     if (!is_exit) continue;
 
-    Instruction *insert_point = term;
+    llvm::Instruction *insert_point = term;
     if (auto *prev = term->getPrevNode()) {
-      if (auto *CI = dyn_cast<CallInst>(prev)) {
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(prev)) {
         if (CI->isTailCall() || CI->isMustTailCall())
           insert_point = CI;
       }
     }
-    IRBuilder<> Builder(insert_point);
+    llvm::IRBuilder<> Builder(insert_point);
     for (auto &[offset, info] : fields) {
       if (info.stores.empty()) continue;
       auto *alloca = field_allocas[offset];
@@ -507,11 +510,12 @@ static bool promoteStateToSSA(Function &F, const DataLayout &DL) {
 // Phase 5: DeadStateRoundtripElimination
 // ============================================================================
 
-static bool getGEPBaseAndOffset(Value *V, Value *&base, uint64_t &offset) {
-  auto *GEP = dyn_cast<GetElementPtrInst>(V);
+static bool getGEPBaseAndOffset(llvm::Value *V, llvm::Value *&base,
+                                 uint64_t &offset) {
+  auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(V);
   if (!GEP || GEP->getNumIndices() != 1)
     return false;
-  auto *Idx = dyn_cast<ConstantInt>(GEP->getOperand(1));
+  auto *Idx = llvm::dyn_cast<llvm::ConstantInt>(GEP->getOperand(1));
   if (!Idx)
     return false;
   base = GEP->getPointerOperand();
@@ -519,16 +523,16 @@ static bool getGEPBaseAndOffset(Value *V, Value *&base, uint64_t &offset) {
   return true;
 }
 
-static bool noInterveningClobber(LoadInst *LI, StoreInst *SI,
-                                  Value *base, uint64_t offset) {
+static bool noInterveningClobber(llvm::LoadInst *LI, llvm::StoreInst *SI,
+                                  llvm::Value *base, uint64_t offset) {
   if (LI->getParent() != SI->getParent())
     return false;
 
   for (auto it = std::next(LI->getIterator()); &*it != SI; ++it) {
-    if (isa<CallBase>(&*it))
+    if (llvm::isa<llvm::CallBase>(&*it))
       return false;
-    if (auto *S = dyn_cast<StoreInst>(&*it)) {
-      Value *s_base = nullptr;
+    if (auto *S = llvm::dyn_cast<llvm::StoreInst>(&*it)) {
+      llvm::Value *s_base = nullptr;
       uint64_t s_offset = 0;
       if (getGEPBaseAndOffset(S->getPointerOperand(), s_base, s_offset)) {
         if (s_base == base && s_offset == offset)
@@ -541,20 +545,20 @@ static bool noInterveningClobber(LoadInst *LI, StoreInst *SI,
   return true;
 }
 
-static bool eliminateDeadRoundtrips(Function &F) {
+static bool eliminateDeadRoundtrips(llvm::Function &F) {
   bool changed = false;
-  SmallVector<std::pair<LoadInst *, StoreInst *>, 16> to_remove;
+  llvm::SmallVector<std::pair<llvm::LoadInst *, llvm::StoreInst *>, 16> to_remove;
 
   for (auto &BB : F) {
     for (auto &I : BB) {
-      auto *SI = dyn_cast<StoreInst>(&I);
+      auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
       if (!SI || SI->isVolatile()) continue;
 
-      auto *LI = dyn_cast<LoadInst>(SI->getValueOperand());
+      auto *LI = llvm::dyn_cast<llvm::LoadInst>(SI->getValueOperand());
       if (!LI || LI->isVolatile()) continue;
       if (!LI->hasOneUse()) continue;
 
-      Value *load_base = nullptr, *store_base = nullptr;
+      llvm::Value *load_base = nullptr, *store_base = nullptr;
       uint64_t load_offset = 0, store_offset = 0;
       if (!getGEPBaseAndOffset(LI->getPointerOperand(), load_base, load_offset))
         continue;
@@ -584,8 +588,8 @@ static bool eliminateDeadRoundtrips(Function &F) {
 // Pass entry point
 // ============================================================================
 
-PreservedAnalyses OptimizeStatePass::run(Function &F,
-                                          FunctionAnalysisManager &AM) {
+llvm::PreservedAnalyses OptimizeStatePass::run(llvm::Function &F,
+                                          llvm::FunctionAnalysisManager &AM) {
   auto &DL = F.getParent()->getDataLayout();
   bool changed = false;
 
@@ -607,9 +611,9 @@ PreservedAnalyses OptimizeStatePass::run(Function &F,
     changed |= eliminateDeadRoundtrips(F);
 
   if (!changed)
-    return PreservedAnalyses::all();
+    return llvm::PreservedAnalyses::all();
 
-  return PreservedAnalyses::none();
+  return llvm::PreservedAnalyses::none();
 }
 
 }  // namespace omill

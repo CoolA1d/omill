@@ -9,12 +9,11 @@
 
 #define DEBUG_TYPE "simplify-vector-reassembly"
 
-using namespace llvm;
-using namespace llvm::PatternMatch;
-
 namespace omill {
 
 namespace {
+
+using namespace llvm::PatternMatch;
 
 // ============================================================================
 // Phase 1: FoldConstantVectorChains
@@ -22,38 +21,38 @@ namespace {
 
 /// Trace a single element of a vector value through nested shufflevectors
 /// and insertelement chains to find the ultimate constant source.
-Constant *traceElement(Value *V, unsigned idx, unsigned depth) {
+llvm::Constant *traceElement(llvm::Value *V, unsigned idx, unsigned depth) {
   if (depth > 16)
     return nullptr;
 
-  if (auto *C = dyn_cast<Constant>(V)) {
-    auto *VTy = dyn_cast<FixedVectorType>(V->getType());
+  if (auto *C = llvm::dyn_cast<llvm::Constant>(V)) {
+    auto *VTy = llvm::dyn_cast<llvm::FixedVectorType>(V->getType());
     if (!VTy)
       return nullptr;
 
-    if (auto *CV = dyn_cast<ConstantVector>(C))
+    if (auto *CV = llvm::dyn_cast<llvm::ConstantVector>(C))
       return CV->getAggregateElement(idx);
-    if (auto *CDV = dyn_cast<ConstantDataVector>(C))
+    if (auto *CDV = llvm::dyn_cast<llvm::ConstantDataVector>(C))
       return CDV->getElementAsConstant(idx);
-    if (isa<ConstantAggregateZero>(C))
-      return Constant::getNullValue(VTy->getElementType());
-    if (isa<PoisonValue>(C))
-      return PoisonValue::get(VTy->getElementType());
-    if (isa<UndefValue>(C))
-      return UndefValue::get(VTy->getElementType());
+    if (llvm::isa<llvm::ConstantAggregateZero>(C))
+      return llvm::Constant::getNullValue(VTy->getElementType());
+    if (llvm::isa<llvm::PoisonValue>(C))
+      return llvm::PoisonValue::get(VTy->getElementType());
+    if (llvm::isa<llvm::UndefValue>(C))
+      return llvm::UndefValue::get(VTy->getElementType());
     return nullptr;
   }
 
-  if (auto *SV = dyn_cast<ShuffleVectorInst>(V)) {
-    auto *VTy = dyn_cast<FixedVectorType>(V->getType());
+  if (auto *SV = llvm::dyn_cast<llvm::ShuffleVectorInst>(V)) {
+    auto *VTy = llvm::dyn_cast<llvm::FixedVectorType>(V->getType());
     if (!VTy)
       return nullptr;
 
     int mask = SV->getMaskValue(idx);
     if (mask < 0)
-      return PoisonValue::get(VTy->getElementType());
+      return llvm::PoisonValue::get(VTy->getElementType());
 
-    auto *SrcTy = cast<FixedVectorType>(SV->getOperand(0)->getType());
+    auto *SrcTy = llvm::cast<llvm::FixedVectorType>(SV->getOperand(0)->getType());
     unsigned num = SrcTy->getNumElements();
 
     if (static_cast<unsigned>(mask) < num)
@@ -62,13 +61,13 @@ Constant *traceElement(Value *V, unsigned idx, unsigned depth) {
       return traceElement(SV->getOperand(1), mask - num, depth + 1);
   }
 
-  if (auto *IE = dyn_cast<InsertElementInst>(V)) {
-    auto *idx_val = dyn_cast<ConstantInt>(IE->getOperand(2));
+  if (auto *IE = llvm::dyn_cast<llvm::InsertElementInst>(V)) {
+    auto *idx_val = llvm::dyn_cast<llvm::ConstantInt>(IE->getOperand(2));
     if (!idx_val)
       return nullptr;
 
     if (idx_val->getZExtValue() == idx) {
-      if (auto *C = dyn_cast<Constant>(IE->getOperand(1)))
+      if (auto *C = llvm::dyn_cast<llvm::Constant>(IE->getOperand(1)))
         return C;
       return nullptr;
     }
@@ -78,22 +77,22 @@ Constant *traceElement(Value *V, unsigned idx, unsigned depth) {
   return nullptr;
 }
 
-static bool foldConstantVectorChains(Function &F) {
+static bool foldConstantVectorChains(llvm::Function &F) {
   bool changed = false;
 
   for (auto &BB : F) {
     for (auto it = BB.begin(); it != BB.end();) {
       auto *I = &*it++;
 
-      if (!isa<ShuffleVectorInst>(I) && !isa<InsertElementInst>(I))
+      if (!llvm::isa<llvm::ShuffleVectorInst>(I) && !llvm::isa<llvm::InsertElementInst>(I))
         continue;
 
-      auto *VTy = dyn_cast<FixedVectorType>(I->getType());
+      auto *VTy = llvm::dyn_cast<llvm::FixedVectorType>(I->getType());
       if (!VTy)
         continue;
 
       unsigned num_elems = VTy->getNumElements();
-      SmallVector<Constant *, 16> elements;
+      llvm::SmallVector<llvm::Constant *, 16> elements;
       bool all_const = true;
 
       for (unsigned i = 0; i < num_elems; ++i) {
@@ -108,9 +107,9 @@ static bool foldConstantVectorChains(Function &F) {
       if (!all_const)
         continue;
 
-      LLVM_DEBUG(dbgs() << "[FoldConstVec] folding: " << *I << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "[FoldConstVec] folding: " << *I << "\n");
 
-      auto *folded = ConstantVector::get(elements);
+      auto *folded = llvm::ConstantVector::get(elements);
       I->replaceAllUsesWith(folded);
       I->eraseFromParent();
       changed = true;
@@ -124,7 +123,7 @@ static bool foldConstantVectorChains(Function &F) {
 // Phase 2: CollapsePartialXMMWrites
 // ============================================================================
 
-static bool collapsePartialXMMWrites(Function &F) {
+static bool collapsePartialXMMWrites(llvm::Function &F) {
   bool changed = false;
   bool changed_this_iter;
 
@@ -133,19 +132,19 @@ static bool collapsePartialXMMWrites(Function &F) {
 
     for (auto &BB : F) {
       for (auto it = BB.begin(); it != BB.end(); ) {
-        auto *EE = dyn_cast<ExtractElementInst>(&*it++);
+        auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(&*it++);
         if (!EE)
           continue;
 
-        auto *idx_ci = dyn_cast<ConstantInt>(EE->getIndexOperand());
+        auto *idx_ci = llvm::dyn_cast<llvm::ConstantInt>(EE->getIndexOperand());
         if (!idx_ci)
           continue;
 
-        auto *SV = dyn_cast<ShuffleVectorInst>(EE->getVectorOperand());
+        auto *SV = llvm::dyn_cast<llvm::ShuffleVectorInst>(EE->getVectorOperand());
         if (!SV)
           continue;
 
-        auto *in_ty = dyn_cast<FixedVectorType>(SV->getOperand(0)->getType());
+        auto *in_ty = llvm::dyn_cast<llvm::FixedVectorType>(SV->getOperand(0)->getType());
         if (!in_ty)
           continue;
 
@@ -157,7 +156,7 @@ static bool collapsePartialXMMWrites(Function &F) {
         unsigned num_in_elts = in_ty->getNumElements();
         unsigned mask_unsigned = static_cast<unsigned>(mask_val);
 
-        Value *src_vec;
+        llvm::Value *src_vec;
         unsigned src_lane;
         if (mask_unsigned < num_in_elts) {
           src_vec = SV->getOperand(0);
@@ -169,11 +168,11 @@ static bool collapsePartialXMMWrites(Function &F) {
 
         // Resolve through nested shufflevectors (depth limit 8).
         for (unsigned depth = 0; depth < 8; ++depth) {
-          auto *inner_sv = dyn_cast<ShuffleVectorInst>(src_vec);
+          auto *inner_sv = llvm::dyn_cast<llvm::ShuffleVectorInst>(src_vec);
           if (!inner_sv)
             break;
           auto *inner_in_ty =
-              dyn_cast<FixedVectorType>(inner_sv->getOperand(0)->getType());
+              llvm::dyn_cast<llvm::FixedVectorType>(inner_sv->getOperand(0)->getType());
           if (!inner_in_ty)
             break;
           int inner_mask = inner_sv->getMaskValue(src_lane);
@@ -192,8 +191,8 @@ static bool collapsePartialXMMWrites(Function &F) {
         if (src_vec == EE->getVectorOperand() && src_lane == lane)
           continue;
 
-        auto *new_idx = ConstantInt::get(idx_ci->getType(), src_lane);
-        auto *new_ee = ExtractElementInst::Create(src_vec, new_idx);
+        auto *new_idx = llvm::ConstantInt::get(idx_ci->getType(), src_lane);
+        auto *new_ee = llvm::ExtractElementInst::Create(src_vec, new_idx);
         new_ee->insertBefore(EE->getIterator());
         EE->replaceAllUsesWith(new_ee);
         EE->eraseFromParent();
@@ -212,25 +211,25 @@ static bool collapsePartialXMMWrites(Function &F) {
 // ============================================================================
 
 struct ByteContribution {
-  Value *root_vec = nullptr;
+  llvm::Value *root_vec = nullptr;
   unsigned src_byte_offset = 0;
   unsigned num_bytes = 0;
   unsigned dst_byte_offset = 0;
 };
 
-static Value *traceVectorRoot(Value *V) {
-  while (auto *BC = dyn_cast<BitCastInst>(V))
+static llvm::Value *traceVectorRoot(llvm::Value *V) {
+  while (auto *BC = llvm::dyn_cast<llvm::BitCastInst>(V))
     V = BC->getOperand(0);
   return V;
 }
 
-static bool matchLeaf(Value *V, unsigned dst_byte_offset,
+static bool matchLeaf(llvm::Value *V, unsigned dst_byte_offset,
                        ByteContribution &contrib) {
-  Value *inner = V;
+  llvm::Value *inner = V;
   unsigned shift_bits = 0;
 
-  Value *shl_lhs;
-  ConstantInt *shl_amt;
+  llvm::Value *shl_lhs;
+  llvm::ConstantInt *shl_amt;
   if (match(V, m_Shl(m_Value(shl_lhs), m_ConstantInt(shl_amt)))) {
     shift_bits = shl_amt->getZExtValue();
     if (shift_bits % 8 != 0)
@@ -239,16 +238,16 @@ static bool matchLeaf(Value *V, unsigned dst_byte_offset,
     dst_byte_offset = shift_bits / 8;
   }
 
-  Value *zext_src;
+  llvm::Value *zext_src;
   if (match(inner, m_ZExt(m_Value(zext_src))))
     inner = zext_src;
 
-  Value *vec;
-  ConstantInt *idx;
+  llvm::Value *vec;
+  llvm::ConstantInt *idx;
   if (!match(inner, m_ExtractElt(m_Value(vec), m_ConstantInt(idx))))
     return false;
 
-  auto *vec_ty = dyn_cast<FixedVectorType>(vec->getType());
+  auto *vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(vec->getType());
   if (!vec_ty)
     return false;
 
@@ -266,9 +265,9 @@ static bool matchLeaf(Value *V, unsigned dst_byte_offset,
   return true;
 }
 
-static bool collectContributions(Value *V,
-                                  SmallVectorImpl<ByteContribution> &contribs) {
-  Value *lhs, *rhs;
+static bool collectContributions(llvm::Value *V,
+                                  llvm::SmallVectorImpl<ByteContribution> &contribs) {
+  llvm::Value *lhs, *rhs;
   if (match(V, m_DisjointOr(m_Value(lhs), m_Value(rhs)))) {
     return collectContributions(lhs, contribs) &&
            collectContributions(rhs, contribs);
@@ -284,19 +283,19 @@ static bool collectContributions(Value *V,
 }
 
 static bool validateContributions(
-    ArrayRef<ByteContribution> contribs, unsigned max_result_bytes,
-    Value *&out_root, unsigned &out_base_byte, unsigned &out_num_bytes,
+    llvm::ArrayRef<ByteContribution> contribs, unsigned max_result_bytes,
+    llvm::Value *&out_root, unsigned &out_base_byte, unsigned &out_num_bytes,
     unsigned &out_min_dst) {
   if (contribs.empty())
     return false;
 
-  Value *root = contribs[0].root_vec;
+  llvm::Value *root = contribs[0].root_vec;
   for (auto &c : contribs) {
     if (c.root_vec != root)
       return false;
   }
 
-  auto *root_ty = dyn_cast<FixedVectorType>(root->getType());
+  auto *root_ty = llvm::dyn_cast<llvm::FixedVectorType>(root->getType());
   if (!root_ty)
     return false;
   unsigned root_bits = root_ty->getPrimitiveSizeInBits();
@@ -321,7 +320,7 @@ static bool validateContributions(
   if (extract_bytes > max_result_bytes)
     return false;
 
-  SmallVector<int, 16> byte_map(extract_bytes, -1);
+  llvm::SmallVector<int, 16> byte_map(extract_bytes, -1);
 
   for (auto &c : contribs) {
     for (unsigned i = 0; i < c.num_bytes; ++i) {
@@ -356,28 +355,28 @@ static bool validateContributions(
   return true;
 }
 
-static bool coalesceByteReassembly(Function &F) {
+static bool coalesceByteReassembly(llvm::Function &F) {
   bool changed = false;
 
   for (auto &BB : F) {
     for (auto it = BB.begin(); it != BB.end(); ) {
       auto *I = &*it++;
 
-      auto *BO = dyn_cast<BinaryOperator>(I);
-      if (!BO || BO->getOpcode() != Instruction::Or)
+      auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(I);
+      if (!BO || BO->getOpcode() != llvm::Instruction::Or)
         continue;
       if (!BO->getType()->isIntegerTy(64))
         continue;
 
       if (!BO->hasPoisonGeneratingFlags() ||
-          !cast<PossiblyDisjointInst>(BO)->isDisjoint())
+          !llvm::cast<llvm::PossiblyDisjointInst>(BO)->isDisjoint())
         continue;
 
-      SmallVector<ByteContribution, 8> contribs;
+      llvm::SmallVector<ByteContribution, 8> contribs;
       if (!collectContributions(BO, contribs))
         continue;
 
-      Value *root_vec = nullptr;
+      llvm::Value *root_vec = nullptr;
       unsigned base_byte = 0;
       unsigned num_bytes = 0;
       unsigned min_dst = 0;
@@ -385,17 +384,17 @@ static bool coalesceByteReassembly(Function &F) {
                                  min_dst))
         continue;
 
-      IRBuilder<> Builder(BO);
+      llvm::IRBuilder<> Builder(BO);
 
       unsigned elem_bits = num_bytes * 8;
       unsigned num_elems = 128 / elem_bits;
-      auto *elem_ty = IntegerType::get(F.getContext(), elem_bits);
-      auto *wide_ty = FixedVectorType::get(elem_ty, num_elems);
-      Value *bc = Builder.CreateBitCast(root_vec, wide_ty);
+      auto *elem_ty = llvm::IntegerType::get(F.getContext(), elem_bits);
+      auto *wide_ty = llvm::FixedVectorType::get(elem_ty, num_elems);
+      llvm::Value *bc = Builder.CreateBitCast(root_vec, wide_ty);
       unsigned lane = base_byte / num_bytes;
-      Value *extract = Builder.CreateExtractElement(bc, lane);
+      llvm::Value *extract = Builder.CreateExtractElement(bc, lane);
 
-      Value *result;
+      llvm::Value *result;
       if (num_bytes < 8) {
         result = Builder.CreateZExt(extract, BO->getType());
       } else {
@@ -419,47 +418,47 @@ static bool coalesceByteReassembly(Function &F) {
 // Phase 4: SimplifyVectorFlagComputation
 // ============================================================================
 
-static bool traceSextOrigin(Value *V, unsigned bit_pos,
-                            SExtInst *&sext_out, unsigned &lane_out) {
-  if (auto *trunc = dyn_cast<TruncInst>(V))
+static bool traceSextOrigin(llvm::Value *V, unsigned bit_pos,
+                            llvm::SExtInst *&sext_out, unsigned &lane_out) {
+  if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(V))
     V = trunc->getOperand(0);
 
   unsigned lshr_amt = 0;
-  Value *lshr_lhs;
-  ConstantInt *lshr_ci;
+  llvm::Value *lshr_lhs;
+  llvm::ConstantInt *lshr_ci;
   if (match(V, m_LShr(m_Value(lshr_lhs), m_ConstantInt(lshr_ci)))) {
     lshr_amt = lshr_ci->getZExtValue();
     V = lshr_lhs;
   }
 
-  auto *EE = dyn_cast<ExtractElementInst>(V);
+  auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(V);
   if (!EE)
     return false;
 
-  auto *idx_ci = dyn_cast<ConstantInt>(EE->getIndexOperand());
+  auto *idx_ci = llvm::dyn_cast<llvm::ConstantInt>(EE->getIndexOperand());
   if (!idx_ci)
     return false;
   unsigned idx = idx_ci->getZExtValue();
 
-  Value *vec = EE->getVectorOperand();
-  auto *vec_ty = dyn_cast<FixedVectorType>(vec->getType());
+  llvm::Value *vec = EE->getVectorOperand();
+  auto *vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(vec->getType());
   if (!vec_ty)
     return false;
   unsigned elem_bits = vec_ty->getElementType()->getIntegerBitWidth();
 
-  if (auto *bc = dyn_cast<BitCastInst>(vec)) {
+  if (auto *bc = llvm::dyn_cast<llvm::BitCastInst>(vec)) {
     vec = bc->getOperand(0);
   }
 
-  auto *sext = dyn_cast<SExtInst>(vec);
+  auto *sext = llvm::dyn_cast<llvm::SExtInst>(vec);
   if (!sext)
     return false;
 
-  auto *src_vec_ty = dyn_cast<FixedVectorType>(sext->getOperand(0)->getType());
+  auto *src_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(sext->getOperand(0)->getType());
   if (!src_vec_ty || !src_vec_ty->getElementType()->isIntegerTy(1))
     return false;
 
-  auto *dst_vec_ty = dyn_cast<FixedVectorType>(sext->getType());
+  auto *dst_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(sext->getType());
   if (!dst_vec_ty)
     return false;
 
@@ -477,32 +476,32 @@ static bool traceSextOrigin(Value *V, unsigned bit_pos,
   return true;
 }
 
-static bool trySimplifyAndMask(Instruction *I) {
-  Value *lhs, *rhs;
+static bool trySimplifyAndMask(llvm::Instruction *I) {
+  llvm::Value *lhs, *rhs;
   if (!match(I, m_And(m_Value(lhs), m_Value(rhs))))
     return false;
 
-  auto *mask_ci = dyn_cast<ConstantInt>(rhs);
+  auto *mask_ci = llvm::dyn_cast<llvm::ConstantInt>(rhs);
   if (!mask_ci)
     return false;
 
-  APInt mask_ap = mask_ci->getValue();
+  llvm::APInt mask_ap = mask_ci->getValue();
   if (!mask_ap.isPowerOf2())
     return false;
 
   unsigned bit_pos = mask_ap.logBase2();
 
-  SExtInst *sext = nullptr;
+  llvm::SExtInst *sext = nullptr;
   unsigned lane = 0;
   if (!traceSextOrigin(lhs, bit_pos, sext, lane))
     return false;
 
-  IRBuilder<> Builder(I);
-  Value *flag = Builder.CreateExtractElement(
+  llvm::IRBuilder<> Builder(I);
+  llvm::Value *flag = Builder.CreateExtractElement(
       sext->getOperand(0), Builder.getInt64(lane));
-  Value *zext_val = Builder.CreateZExt(flag, I->getType());
+  llvm::Value *zext_val = Builder.CreateZExt(flag, I->getType());
 
-  Value *result;
+  llvm::Value *result;
   if (bit_pos == 0) {
     result = zext_val;
   } else {
@@ -514,47 +513,47 @@ static bool trySimplifyAndMask(Instruction *I) {
   return true;
 }
 
-static bool trySimplifyBareLshr(Instruction *I) {
-  Value *inner = I;
+static bool trySimplifyBareLshr(llvm::Instruction *I) {
+  llvm::Value *inner = I;
   bool is_trunc = false;
-  if (auto *trunc = dyn_cast<TruncInst>(I)) {
+  if (auto *trunc = llvm::dyn_cast<llvm::TruncInst>(I)) {
     inner = trunc->getOperand(0);
     is_trunc = true;
   }
 
-  Value *lshr_lhs;
-  ConstantInt *lshr_ci;
+  llvm::Value *lshr_lhs;
+  llvm::ConstantInt *lshr_ci;
   if (!match(inner, m_LShr(m_Value(lshr_lhs), m_ConstantInt(lshr_ci))))
     return false;
 
   unsigned shift_amt = lshr_ci->getZExtValue();
 
-  auto *EE = dyn_cast<ExtractElementInst>(lshr_lhs);
+  auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(lshr_lhs);
   if (!EE)
     return false;
 
-  auto *idx_ci = dyn_cast<ConstantInt>(EE->getIndexOperand());
+  auto *idx_ci = llvm::dyn_cast<llvm::ConstantInt>(EE->getIndexOperand());
   if (!idx_ci)
     return false;
 
-  Value *vec = EE->getVectorOperand();
+  llvm::Value *vec = EE->getVectorOperand();
 
-  if (auto *bc = dyn_cast<BitCastInst>(vec))
+  if (auto *bc = llvm::dyn_cast<llvm::BitCastInst>(vec))
     vec = bc->getOperand(0);
 
-  auto *sext = dyn_cast<SExtInst>(vec);
+  auto *sext = llvm::dyn_cast<llvm::SExtInst>(vec);
   if (!sext)
     return false;
 
-  auto *src_vec_ty = dyn_cast<FixedVectorType>(sext->getOperand(0)->getType());
+  auto *src_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(sext->getOperand(0)->getType());
   if (!src_vec_ty || !src_vec_ty->getElementType()->isIntegerTy(1))
     return false;
 
-  auto *dst_vec_ty = dyn_cast<FixedVectorType>(sext->getType());
+  auto *dst_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(sext->getType());
   if (!dst_vec_ty)
     return false;
 
-  auto *ee_vec_ty = dyn_cast<FixedVectorType>(EE->getVectorOperand()->getType());
+  auto *ee_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(EE->getVectorOperand()->getType());
   if (!ee_vec_ty)
     return false;
 
@@ -571,45 +570,45 @@ static bool trySimplifyBareLshr(Instruction *I) {
   if (!is_trunc && shift_amt != elem_bits - 1)
     return false;
 
-  IRBuilder<> Builder(I);
-  Value *flag = Builder.CreateExtractElement(
+  llvm::IRBuilder<> Builder(I);
+  llvm::Value *flag = Builder.CreateExtractElement(
       sext->getOperand(0), Builder.getInt64(lane));
-  Value *result = Builder.CreateZExt(flag, I->getType());
+  llvm::Value *result = Builder.CreateZExt(flag, I->getType());
 
   I->replaceAllUsesWith(result);
   I->eraseFromParent();
   return true;
 }
 
-static bool tryScalarizeExtractFromSext(Instruction *I) {
-  auto *EE = dyn_cast<ExtractElementInst>(I);
+static bool tryScalarizeExtractFromSext(llvm::Instruction *I) {
+  auto *EE = llvm::dyn_cast<llvm::ExtractElementInst>(I);
   if (!EE)
     return false;
 
-  auto *idx_ci = dyn_cast<ConstantInt>(EE->getIndexOperand());
+  auto *idx_ci = llvm::dyn_cast<llvm::ConstantInt>(EE->getIndexOperand());
   if (!idx_ci)
     return false;
   unsigned idx = idx_ci->getZExtValue();
 
-  Value *vec = EE->getVectorOperand();
-  auto *vec_ty = dyn_cast<FixedVectorType>(vec->getType());
+  llvm::Value *vec = EE->getVectorOperand();
+  auto *vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(vec->getType());
   if (!vec_ty || !vec_ty->getElementType()->isIntegerTy())
     return false;
   unsigned elem_bits = vec_ty->getElementType()->getIntegerBitWidth();
 
-  Value *inner = vec;
-  if (auto *bc = dyn_cast<BitCastInst>(inner))
+  llvm::Value *inner = vec;
+  if (auto *bc = llvm::dyn_cast<llvm::BitCastInst>(inner))
     inner = bc->getOperand(0);
 
-  auto *sext = dyn_cast<SExtInst>(inner);
+  auto *sext = llvm::dyn_cast<llvm::SExtInst>(inner);
   if (!sext)
     return false;
 
-  auto *src_vec_ty = dyn_cast<FixedVectorType>(sext->getOperand(0)->getType());
+  auto *src_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(sext->getOperand(0)->getType());
   if (!src_vec_ty || !src_vec_ty->getElementType()->isIntegerTy(1))
     return false;
 
-  auto *dst_vec_ty = dyn_cast<FixedVectorType>(sext->getType());
+  auto *dst_vec_ty = llvm::dyn_cast<llvm::FixedVectorType>(sext->getType());
   if (!dst_vec_ty)
     return false;
 
@@ -619,10 +618,10 @@ static bool tryScalarizeExtractFromSext(Instruction *I) {
   if (inner == vec) {
     if (idx >= num_lanes)
       return false;
-    IRBuilder<> Builder(I);
-    Value *flag = Builder.CreateExtractElement(sext->getOperand(0),
+    llvm::IRBuilder<> Builder(I);
+    llvm::Value *flag = Builder.CreateExtractElement(sext->getOperand(0),
                                                Builder.getInt64(idx));
-    Value *result = Builder.CreateSExt(flag, I->getType());
+    llvm::Value *result = Builder.CreateSExt(flag, I->getType());
     I->replaceAllUsesWith(result);
     I->eraseFromParent();
     return true;
@@ -635,16 +634,16 @@ static bool tryScalarizeExtractFromSext(Instruction *I) {
   if (lane_lo != lane_hi || lane_lo >= num_lanes)
     return false;
 
-  IRBuilder<> Builder(I);
-  Value *flag = Builder.CreateExtractElement(sext->getOperand(0),
+  llvm::IRBuilder<> Builder(I);
+  llvm::Value *flag = Builder.CreateExtractElement(sext->getOperand(0),
                                              Builder.getInt64(lane_lo));
-  Value *result = Builder.CreateSExt(flag, I->getType());
+  llvm::Value *result = Builder.CreateSExt(flag, I->getType());
   I->replaceAllUsesWith(result);
   I->eraseFromParent();
   return true;
 }
 
-static bool simplifyVectorFlagComputation(Function &F) {
+static bool simplifyVectorFlagComputation(llvm::Function &F) {
   bool changed = false;
   bool changed_this_iter;
 
@@ -653,7 +652,7 @@ static bool simplifyVectorFlagComputation(Function &F) {
 
     for (auto &BB : F) {
       for (auto it = BB.begin(); it != BB.end(); ) {
-        Instruction *I = &*it++;
+        llvm::Instruction *I = &*it++;
 
         if (trySimplifyAndMask(I)) {
           changed_this_iter = true;
@@ -684,8 +683,8 @@ static bool simplifyVectorFlagComputation(Function &F) {
 // Pass entry point
 // ============================================================================
 
-PreservedAnalyses SimplifyVectorReassemblyPass::run(
-    Function &F, FunctionAnalysisManager &AM) {
+llvm::PreservedAnalyses SimplifyVectorReassemblyPass::run(
+    llvm::Function &F, llvm::FunctionAnalysisManager &AM) {
   bool changed = false;
 
   changed |= foldConstantVectorChains(F);
@@ -694,10 +693,10 @@ PreservedAnalyses SimplifyVectorReassemblyPass::run(
   changed |= simplifyVectorFlagComputation(F);
 
   if (!changed)
-    return PreservedAnalyses::all();
+    return llvm::PreservedAnalyses::all();
 
-  PreservedAnalyses PA;
-  PA.preserveSet<CFGAnalyses>();
+  llvm::PreservedAnalyses PA;
+  PA.preserveSet<llvm::CFGAnalyses>();
   return PA;
 }
 
