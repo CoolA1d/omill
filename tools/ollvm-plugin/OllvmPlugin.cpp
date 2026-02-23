@@ -5,7 +5,6 @@
 /// Or:        opt -load-pass-plugin=OllvmPlugin.so -passes=ollvm-obfuscate ...
 ///
 /// Annotate functions in source with OLLVM_FLATTEN, OLLVM_SUBSTITUTE, etc.
-/// (see include/omill/OllvmAttrs.h).
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Module.h>

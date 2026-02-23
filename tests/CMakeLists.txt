@@ -94,6 +94,9 @@ add_executable(omill-unit-tests
   unit/LowerRemillIntrinsicsTest.cpp
   unit/ResolveAndLowerControlFlowTest.cpp
   unit/InlineJumpTargetsTest.cpp
+  unit/LiftedNamesTest.cpp
+  unit/BinaryMemoryMapTest.cpp
+  unit/StateFieldAccessAnalysisTest.cpp
 )
 
 target_link_libraries(omill-unit-tests
