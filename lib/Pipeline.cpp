@@ -585,14 +585,18 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
     FPM.addPass(llvm::SimplifyCFGPass());
   }
   // Unroll small constant-trip-count decrypt loops (e.g. CW_STR XOR cipher)
-  // so their body stores become straight-line code eligible for
-  // OutlineConstantStackData promotion.
+  // so their body stores become straight-line code.  GVN then forwards
+  // entry-block stores to the unrolled loads, enabling InstCombine to fold
+  // XOR operations to constants — making all stores constant and eliminating
+  // loads so OutlineConstantStackData can promote the alloca to a global.
   if (!envDisabled("OMILL_SKIP_DEOBF_LOOP_UNROLL")) {
     FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopRotatePass()));
     FPM.addPass(llvm::LoopUnrollPass(
         llvm::LoopUnrollOptions().setFullUnrollMaxCount(256)));
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::InstCombinePass());
   }
   // Promote stack allocas with all-constant stores to global constants.
   // After xorstr folding (and now loop unrolling), decrypted strings are

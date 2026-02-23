@@ -617,22 +617,18 @@ TEST_F(DeobfuscationTest, ObfAlgoSHA256Recovery) {
 // Cloakwork obfuscation tests
 // =============================================================================
 
-/// CW_STR string recovery: TLS-guarded constinit XOR cipher.
+/// CW_STR string recovery: XTEA-encrypted constinit strings.
 ///
-/// Full string recovery requires the decrypt loop to be fully unrolled
-/// and XOR operations folded to constants.  CW_STR's TLS guard and
-/// complex initialization pattern currently prevent full promotion.
-/// Test verifies pipeline runs without crash.
+/// CW_STR uses XTEA (32-round Feistel network) for encryption, with TLS-
+/// guarded double-checked locking for thread-safe lazy decryption.  Full
+/// static recovery requires evaluating the XTEA decrypt across hundreds of
+/// dependent arithmetic ops — beyond what loop unrolling + GVN can achieve.
+/// Test verifies pipeline runs without crash and produces a native wrapper.
 TEST_F(DeobfuscationTest, CloakworkStrRecovery) {
   ASSERT_TRUE(liftAndOptimize("cw_str_hello"));
   EXPECT_TRUE(verifyModule()) << "Module invalid after optimization";
-
-  bool has_string = hasGlobalConstantString(
-      llvm::StringRef("Hello, World!\0", 14));
-  if (!has_string) {
-    EXPECT_GT(countNativeFunctions(), 0u)
-        << "Expected at least one native function from CW_STR";
-  }
+  EXPECT_GT(countNativeFunctions(), 0u)
+      << "Expected at least one native function from CW_STR";
 }
 
 /// Cloakwork CW_IMPORT: PEB walking with FNV-1a hashing.
