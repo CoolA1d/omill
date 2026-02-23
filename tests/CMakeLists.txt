@@ -93,6 +93,7 @@ add_executable(omill-unit-tests
   unit/SimplifyVectorReassemblyTest.cpp
   unit/LowerRemillIntrinsicsTest.cpp
   unit/ResolveAndLowerControlFlowTest.cpp
+  unit/InlineJumpTargetsTest.cpp
 )
 
 target_link_libraries(omill-unit-tests

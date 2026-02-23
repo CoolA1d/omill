@@ -617,23 +617,19 @@ TEST_F(DeobfuscationTest, ObfAlgoSHA256Recovery) {
 // Cloakwork obfuscation tests
 // =============================================================================
 
-/// CW_STR string recovery: decrypts TLS-guarded constinit strings.
+/// CW_STR string recovery: TLS-guarded constinit XOR cipher.
 ///
-/// Previously crashed with SEH 0xc0000005 (fixed by removePredecessor patches).
-/// String recovery is partial — the function lifts and optimizes successfully
-/// but the pipeline doesn't yet fully resolve the decrypted constant.
+/// Full string recovery requires the decrypt loop to be fully unrolled
+/// and XOR operations folded to constants.  CW_STR's TLS guard and
+/// complex initialization pattern currently prevent full promotion.
+/// Test verifies pipeline runs without crash.
 TEST_F(DeobfuscationTest, CloakworkStrRecovery) {
   ASSERT_TRUE(liftAndOptimize("cw_str_hello"));
   EXPECT_TRUE(verifyModule()) << "Module invalid after optimization";
 
-  // Ideal: fully recovered string in promoted global.
   bool has_string = hasGlobalConstantString(
       llvm::StringRef("Hello, World!\0", 14));
-  // Current: pipeline optimizes without crash but doesn't yet fully
-  // decrypt.  Accept either outcome to prevent regression.
-  EXPECT_TRUE(verifyModule());
   if (!has_string) {
-    // Verify at minimum that we have native functions (pipeline ran).
     EXPECT_GT(countNativeFunctions(), 0u)
         << "Expected at least one native function from CW_STR";
   }

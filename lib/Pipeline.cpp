@@ -19,6 +19,8 @@
 #include <llvm/Transforms/IPO/SCCP.h>
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/LoopDeletion.h>
+#include <llvm/Transforms/Scalar/LoopRotation.h>
+#include <llvm/Transforms/Scalar/LoopUnrollPass.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 
 #include <cstdlib>
@@ -582,9 +584,19 @@ void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM) {
     FPM.addPass(ControlFlowUnflattenerPass());
     FPM.addPass(llvm::SimplifyCFGPass());
   }
+  // Unroll small constant-trip-count decrypt loops (e.g. CW_STR XOR cipher)
+  // so their body stores become straight-line code eligible for
+  // OutlineConstantStackData promotion.
+  if (!envDisabled("OMILL_SKIP_DEOBF_LOOP_UNROLL")) {
+    FPM.addPass(llvm::createFunctionToLoopPassAdaptor(llvm::LoopRotatePass()));
+    FPM.addPass(llvm::LoopUnrollPass(
+        llvm::LoopUnrollOptions().setFullUnrollMaxCount(256)));
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+  }
   // Promote stack allocas with all-constant stores to global constants.
-  // After xorstr folding, decrypted strings are constant stores to allocas;
-  // outlining them enables further simplification and cleaner output.
+  // After xorstr folding (and now loop unrolling), decrypted strings are
+  // constant stores to allocas; outlining enables further simplification.
   if (!envDisabled("OMILL_SKIP_DEOBF_OUTLINE_CONST_STACK")) {
     FPM.addPass(OutlineConstantStackDataPass());
   }
