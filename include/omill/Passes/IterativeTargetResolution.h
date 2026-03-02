@@ -18,7 +18,7 @@ namespace omill {
 class IterativeTargetResolutionPass
     : public llvm::PassInfoMixin<IterativeTargetResolutionPass> {
  public:
-  explicit IterativeTargetResolutionPass(unsigned max_iterations = 10)
+  explicit IterativeTargetResolutionPass(unsigned max_iterations = 32)
       : max_iterations_(max_iterations) {}
 
   llvm::PreservedAnalyses run(llvm::Module &M,

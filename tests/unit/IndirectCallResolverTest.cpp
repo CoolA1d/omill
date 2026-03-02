@@ -364,7 +364,7 @@ TEST_F(IndirectCallResolverTest, AlreadyConstant_Skipped) {
 }
 
 // ===----------------------------------------------------------------------===
-// Test 5: Truly dynamic target (function argument) — left unchanged
+// Test 5: Truly dynamic target (load from unknown pointer) — left unchanged
 // ===----------------------------------------------------------------------===
 TEST_F(IndirectCallResolverTest, DynamicTarget_LeftUnchanged) {
   auto M = createModule();
@@ -375,10 +375,14 @@ TEST_F(IndirectCallResolverTest, DynamicTarget_LeftUnchanged) {
   auto *BB = llvm::BasicBlock::Create(Ctx, "entry", fn);
   llvm::IRBuilder<> B(BB);
 
-  // Target is the PC argument (arg 1) — truly dynamic.
+  // Target is a load from a dynamic pointer (arg 0 cast to i64*) — truly
+  // dynamic and unresolvable.  We can't use arg 1 because arg 1 of a
+  // sub_<hex> function is the entry PC, which evaluateToConstant resolves.
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *dynamic_target = B.CreateLoad(i64_ty, fn->getArg(0), "dyn_target");
   auto *dispatch = declareDispatchCall(*M);
   auto *call = B.CreateCall(dispatch, {fn->getArg(0),
-                                       fn->getArg(1),
+                                       dynamic_target,
                                        fn->getArg(2)});
   B.CreateRet(call);
 

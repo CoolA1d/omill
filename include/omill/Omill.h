@@ -37,7 +37,9 @@ struct PipelineOptions {
   bool interprocedural_const_prop = false;
 
   /// Maximum iterations for iterative target resolution.
-  unsigned max_resolution_iterations = 10;
+  /// Each VM handler in a chain requires ~2 iterations (lift + inline+resolve),
+  /// so this needs to be high enough to handle long handler chains.
+  unsigned max_resolution_iterations = 32;
 
   /// Refine _native function parameter types (ptr vs i64 vs double).
   /// Opt-in; runs late in Phase 4 after ABI recovery.

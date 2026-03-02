@@ -158,15 +158,19 @@ TEST_F(IterativeTargetResolutionTest, UnresolvableTarget_StopsAtFixpoint) {
 
   createDispatchCallDecl(*M);
 
-  // Caller with dynamic target (function arg, not constant).
+  // Caller with dynamic target (load from State pointer — truly unresolvable).
+  // We can't use arg 1 because evaluateToConstant resolves arg 1 of sub_*
+  // functions to the entry PC extracted from the function name.
   auto *F = llvm::Function::Create(liftedFnType(),
                                     llvm::Function::ExternalLinkage,
                                     "sub_140001000", *M);
   auto *entry = llvm::BasicBlock::Create(Ctx, "entry", F);
   llvm::IRBuilder<> B(entry);
+  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *dyn_target = B.CreateLoad(i64_ty, F->getArg(0), "dyn_target");
   auto *dispatch = M->getFunction("__omill_dispatch_call");
   auto *result = B.CreateCall(
-      dispatch, {F->getArg(0), F->getArg(1), F->getArg(2)});
+      dispatch, {F->getArg(0), dyn_target, F->getArg(2)});
   B.CreateRet(result);
 
   EXPECT_EQ(1u, countUnresolvedDispatches(*M));
