@@ -534,6 +534,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "ABI: GlobalDCE dead originals");
   if (!envDisabled("OMILL_SKIP_ABI_GLOBAL_DCE")) {
     MPM.addPass(llvm::GlobalDCEPass());
   }
@@ -660,6 +661,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     };
     MPM.addPass(InlineVMHandlersAndCleanupPass{});
   }
+  addPhaseMarker(MPM, "ABI: final cleanup");
   // Strip @llvm.compiler.used and run GlobalDCE to remove dead ISEL stubs.
   if (!envDisabled("OMILL_SKIP_STRIP_COMPILER_USED")) {
     MPM.addPass(StripCompilerUsedPass());
@@ -1088,10 +1090,14 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     }
 
     addPhaseMarker(MPM, "Phase 3.56: VM handler inlining");
-    // Inline small handler calls.
+    // Inline small handler calls.  VMHandlerInlinerPass performs its own
+    // inlining via llvm::InlineFunction and erases dead handlers, so no
+    // separate AlwaysInlinerPass is needed.
     MPM.addPass(VMHandlerInlinerPass(/*max_handler_instrs=*/500,
                                      /*min_callsites=*/1));
-    MPM.addPass(llvm::AlwaysInlinerPass());
+    // Remove remaining dead handler functions BEFORE the expensive cleanup
+    // passes to avoid running SROA/GVN/InstCombine on dead code.
+    MPM.addPass(llvm::GlobalDCEPass());
 
     addPhaseMarker(MPM, "Phase 3.56: post-handler cleanup");
     // Clean up after handler inlining.
@@ -1107,7 +1113,6 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       FPM.addPass(llvm::SimplifyCFGPass());
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
-    MPM.addPass(llvm::GlobalDCEPass());
   }
 
   addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
