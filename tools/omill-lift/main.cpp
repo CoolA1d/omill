@@ -753,13 +753,41 @@ int main(int argc, char **argv) {
 
       omill::TraceLifter late_lifter(late_arch.get(), late_manager);
 
-      // Shallow-lift: only the target function, not its callee graph.
-      late_manager.setMaxLiftCount(1);
+      // Lift the target functions and their full callee graphs.
       for (uint64_t pc : late_targets) {
-        late_manager.resetLiftCount();
         late_lifter.Lift(pc);
       }
-      late_manager.setMaxLiftCount(0);
+
+      // Fix up DeclareLiftedFunction naming collisions.  When the
+      // TraceLifter creates a declaration for a callee reference and
+      // later defines it, LLVM appends ".N" to the definition because
+      // the declaration already occupies the name.  Replace uses of
+      // the empty declaration with the actual definition, then rename.
+      for (auto &F : llvm::make_early_inc_range(*late_module)) {
+        if (!F.isDeclaration())
+          continue;
+        auto name = F.getName();
+        if (!name.starts_with("sub_"))
+          continue;
+        for (int i = 1; i <= 20; ++i) {
+          std::string def_name =
+              (name + "." + llvm::Twine(i)).str();
+          if (auto *def = late_module->getFunction(def_name)) {
+            if (!def->isDeclaration()) {
+              F.replaceAllUsesWith(def);
+              F.eraseFromParent();
+              def->setName(name);
+              break;
+            }
+          }
+        }
+      }
+
+      if (DumpIR) {
+        std::error_code ec;
+        raw_fd_ostream os("late_after_lift.ll", ec, sys::fs::OF_Text);
+        late_module->print(os, nullptr);
+      }
 
       // Run the pipeline on the fresh module.
       {
@@ -808,10 +836,37 @@ int main(int argc, char **argv) {
           omill::buildPipeline(MPM, late_opts);
           MPM.run(*late_module, late_MAM);
         }
+        if (DumpIR) {
+          std::error_code ec;
+          raw_fd_ostream os("late_after_pipeline.ll", ec,
+                            sys::fs::OF_Text);
+          late_module->print(os, nullptr);
+        }
         {
           ModulePassManager MPM;
           omill::buildABIRecoveryPipeline(MPM);
           MPM.run(*late_module, late_MAM);
+        }
+      }
+
+      if (DumpIR) {
+        std::error_code ec;
+        raw_fd_ostream os("late_after_abi.ll", ec, sys::fs::OF_Text);
+        late_module->print(os, nullptr);
+      }
+
+      // Remove conflicting definitions from the late module.  The main
+      // module's initial callee graph may already contain some of the
+      // same functions; keep those and let the linker resolve the late
+      // module's references to the existing definitions.
+      for (auto &F : llvm::make_early_inc_range(*late_module)) {
+        if (F.isDeclaration())
+          continue;
+        if (auto *existing = module->getFunction(F.getName())) {
+          if (!existing->isDeclaration()) {
+            F.deleteBody();
+            F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+          }
         }
       }
 

@@ -131,8 +131,19 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   // Keeping RSP as a dynamic pointer avoids constant-folding stack math into
   // degenerate infinite loops in flattened dispatchers.
   constexpr uint64_t kSyntheticStackSize = 1ull << 16;  // 64 KiB
-  auto *stack_ty = llvm::ArrayType::get(Builder.getInt8Ty(), kSyntheticStackSize);
+  // Extra room above RSP for caller-frame reads (e.g. RSP+456 in
+  // sub_1402d4b7e).  Without this, positive RSP-relative loads fall
+  // outside the alloca → OOB UB → optimizer folds body to unreachable.
+  constexpr uint64_t kCallerFrameRoom = 0x1000;  // 4 KiB
+  constexpr uint64_t kTotalStackSize = kSyntheticStackSize + kCallerFrameRoom;
+  auto *stack_ty =
+      llvm::ArrayType::get(Builder.getInt8Ty(), kTotalStackSize);
   auto *stack_alloca = Builder.CreateAlloca(stack_ty, nullptr, "native_stack");
+  // Fill with 0xCC so reads from caller-frame offsets yield a definite
+  // non-null/non-zero value instead of undef.  inttoptr(0xCC..CC) is not
+  // UB, so the optimizer won't collapse the function body to unreachable.
+  Builder.CreateMemSet(stack_alloca, Builder.getInt8(0xCC),
+                        kTotalStackSize, llvm::MaybeAlign(16));
   auto *stack_top = Builder.CreateConstGEP1_64(
       Builder.getInt8Ty(), stack_alloca, kSyntheticStackSize - 0x20);
   auto *stack_top_i64 = Builder.CreatePtrToInt(stack_top, Builder.getInt64Ty());
@@ -277,7 +288,15 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
 
   for (auto *F : functions) {
     auto *abi = cc_info.getABI(F);
-    if (!abi) continue;
+    if (!abi) {
+      if (getenv("OMILL_DEBUG_REWRITE"))
+        llvm::errs() << "[Sigs] No ABI for " << F->getName() << "\n";
+      continue;
+    }
+    if (getenv("OMILL_DEBUG_REWRITE"))
+      llvm::errs() << "[Sigs] Creating wrapper for " << F->getName()
+                    << " params=" << abi->numParams()
+                    << " ret=" << abi->ret.has_value() << "\n";
     createNativeWrapper(F, *abi, field_map);
     changed = true;
   }

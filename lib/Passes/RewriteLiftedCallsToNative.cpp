@@ -231,16 +231,21 @@ void collectCandidates(llvm::Function &F, const LiftedFunctionMap &lifted,
         }
       }
 
-      // B3: Dynamic target — still rewrite to prevent State escape.
-      // Keep unresolved jump dispatches as calls to __omill_dispatch_jump.
-      // Rewriting them to inttoptr(target_pc) can call raw binary VAs.
+      // B3: Dynamic target.
+      // dispatch_jump: only rewrite inside _native wrappers.  The target
+      // is typically the function's tail-dispatch PC which has already
+      // been stored to the RIP State field; rewriting it in the original
+      // lifted function would create complex inttoptr patterns that crash
+      // GVN's PHI-translation in the inlined _native wrapper.
       if (is_dispatch_jump) {
-        if (F.getName().ends_with("_native")) {
-          candidates.push_back({call, nullptr, call->getArgOperand(0), true});
-        }
+        if (!F.getName().ends_with("_native"))
+          continue;
+        candidates.push_back({call, nullptr, call->getArgOperand(0), true});
         continue;
       }
 
+      // dispatch_call: rewrite everywhere so the constant target can
+      // propagate through ABI recovery for late target discovery.
       candidates.push_back({call, nullptr, call->getArgOperand(0), false});
     }
   }
@@ -272,6 +277,18 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
     llvm::SmallVector<RewriteCandidate, 8> candidates;
     collectCandidates(F, lifted, non_leaf_set, candidates);
     if (candidates.empty()) continue;
+
+    if (getenv("OMILL_DEBUG_REWRITE")) {
+      llvm::errs() << "[Rewrite] " << F.getName()
+                    << ": " << candidates.size() << " candidates\n";
+      for (auto &c : candidates) {
+        llvm::errs() << "  call to "
+                      << (c.lifted_definition
+                              ? c.lifted_definition->getName()
+                              : llvm::StringRef("(dynamic)"))
+                      << " dispatch_jump=" << c.is_dispatch_jump << "\n";
+      }
+    }
 
     for (auto &cand : candidates) {
       if (cand.lifted_definition) {
