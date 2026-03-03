@@ -126,6 +126,11 @@ static cl::opt<bool> VerifyEach(
     cl::desc("Run module verifier after every pass (slow, for debugging)"),
     cl::init(false));
 
+static cl::opt<std::string> TraceFunc(
+    "trace-func",
+    cl::desc("Print block/instruction counts for a named function after each "
+             "omill pass (e.g. sub_1800444a0)"));
+
 static cl::opt<std::string> ScanSection(
     "scan-section",
     cl::desc("Scan a PE section and output function classification as JSON"));
@@ -1039,6 +1044,66 @@ int main(int argc, char **argv) {
             }
             exit(1);
           }
+        });
+  }
+
+  // --trace-func: print block/instruction counts after every pass for a
+  // specific function.  Helps diagnose when the function body disappears.
+  if (!TraceFunc.empty()) {
+    // Track both the lifted name and the _native wrapper.
+    std::string target_base = TraceFunc;
+    std::string target_native = target_base + "_native";
+    unsigned prev_blocks = 0, prev_insts = 0;
+    unsigned prev_blocks_n = 0, prev_insts_n = 0;
+    PIC.registerAfterPassCallback(
+        [=, &prev_blocks, &prev_insts,
+         &prev_blocks_n, &prev_insts_n](
+            StringRef PassName, Any IR, const PreservedAnalyses &) mutable {
+          const Module *M = nullptr;
+          if (const auto **F = any_cast<const Function *>(&IR))
+            M = (*F)->getParent();
+          else if (const auto **MPtr = any_cast<const Module *>(&IR))
+            M = *MPtr;
+          else if (const auto **L = any_cast<const Loop *>(&IR))
+            M = (*L)->getHeader()->getParent()->getParent();
+          if (!M) return;
+
+          auto report = [&](const std::string &name,
+                            unsigned &pb, unsigned &pi) {
+            auto *F = M->getFunction(name);
+            if (!F || F->isDeclaration()) {
+              if (pb != 0 || pi != 0) {
+                errs() << "[TRACE] " << PassName << " | " << name
+                       << ": GONE (was " << pb << " blocks, "
+                       << pi << " instrs)\n";
+                pb = 0;
+                pi = 0;
+              }
+              return;
+            }
+            unsigned blocks = 0, insts = 0;
+            for (auto &BB : *F) {
+              ++blocks;
+              insts += BB.size();
+            }
+            if (blocks != pb || insts != pi) {
+              errs() << "[TRACE] " << PassName << " | " << name
+                     << ": " << blocks << " blocks, " << insts
+                     << " instrs";
+              if (pb != 0) {
+                int db = (int)blocks - (int)pb;
+                int di = (int)insts - (int)pi;
+                errs() << " (delta: " << db << " blocks, "
+                       << di << " instrs)";
+              }
+              errs() << "\n";
+              pb = blocks;
+              pi = insts;
+            }
+          };
+
+          report(target_base, prev_blocks, prev_insts);
+          report(target_native, prev_blocks_n, prev_insts_n);
         });
   }
 
