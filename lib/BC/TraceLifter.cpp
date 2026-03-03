@@ -361,8 +361,9 @@ bool TraceLifter::Impl::Lift(
 
       auto decode_ok = arch->DecodeInstruction(
           inst_addr, inst_bytes, inst, this->arch->CreateInitialContext());
-      if (!decode_ok) {
-        llvm::errs() << "omill: TraceLifter: decode failed at 0x"
+      if (!decode_ok && inst_addr == trace_addr) {
+        // Entry-point decode failure — the handler VA itself is invalid.
+        llvm::errs() << "omill: TraceLifter: decode failed at entry 0x"
                      << llvm::Twine::utohexstr(inst_addr) << "\n";
       }
 
