@@ -955,12 +955,67 @@ int main(int argc, char **argv) {
                               /*VerifyEach=*/false);
   SI.registerCallbacks(PIC, &MAM);
 
-  // Custom safe verify-each: uses nullptr stream to avoid crash in
-  // SlotTracker on corrupted modules, then aborts with pass name.
+  // Custom safe verify-each: only runs after omill custom passes (not LLVM
+  // standard passes) for performance.  Uses nullptr stream to avoid crash
+  // in SlotTracker on corrupted modules.
   if (VerifyEach) {
     PIC.registerAfterPassCallback(
         [&](StringRef PassName, Any IR,
             const PreservedAnalyses &) {
+          // Skip standard LLVM passes — verifying after every InstCombine/
+          // GVN/SimplifyCFG etc. is prohibitively slow.
+          static const char *const llvm_passes[] = {
+              "InstCombinePass",
+              "GVNPass",
+              "SimplifyCFGPass",
+              "SROAPass",
+              "ADCEPass",
+              "DSEPass",
+              "EarlyCSEPass",
+              "GlobalDCEPass",
+              "AlwaysInlinerPass",
+              "InlinerPass",
+              "GlobalOptPass",
+              "LoopSimplifyPass",
+              "LCSSAPass",
+              "LoopRotatePass",
+              "LICMPass",
+              "IndVarSimplifyPass",
+              "LoopDeletionPass",
+              "LoopUnrollPass",
+              "JumpThreadingPass",
+              "CorrelatedValuePropagationPass",
+              "MemCpyOptPass",
+              "SCCPPass",
+              "BDCEPass",
+              "ReassociatePass",
+              "MergedLoadStoreMotionPass",
+              "TailCallElimPass",
+              "PromotePass",
+              "AggressiveInstCombinePass",
+              "LibCallsShrinkWrapPass",
+              "ConstraintEliminationPass",
+              "CoroSplitPass",
+              "CoroElidePass",
+              "InvalidateAnalysisPass",
+              "RequireAnalysisPass",
+              "VerifierPass",
+              "PrintModulePass",
+              "BitcodeWriterPass",
+          };
+          for (const char *p : llvm_passes) {
+            if (PassName == p) return;
+          }
+          // Also skip pass manager wrappers and adaptors.
+          if (PassName.starts_with("PassManager") ||
+              PassName.starts_with("ModuleToFunction") ||
+              PassName.starts_with("CGSCCToFunction") ||
+              PassName.starts_with("ModuleInliner") ||
+              PassName.starts_with("DevirtSCCRepeated") ||
+              PassName.contains("Adaptor") ||
+              PassName.contains("PassManager"))
+            return;
+
           // Extract the module from whatever IR level we're at.
           const Module *M = nullptr;
           if (const auto **F = any_cast<const Function *>(&IR))
