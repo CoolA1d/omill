@@ -536,7 +536,6 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::InstCombinePass());
-    FPM.addPass(llvm::SimplifyCFGPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 

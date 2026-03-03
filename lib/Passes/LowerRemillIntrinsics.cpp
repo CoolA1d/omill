@@ -873,7 +873,6 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
 
 void lowerIOPort(llvm::CallInst *CI, IntrinsicKind kind) {
   llvm::IRBuilder<> Builder(CI);
-  auto &M = *CI->getModule();
   auto &Ctx = CI->getContext();
 
   bool is_read = (kind == IntrinsicKind::kReadIOPort8 ||
@@ -896,20 +895,35 @@ void lowerIOPort(llvm::CallInst *CI, IntrinsicKind kind) {
   }
 
   auto *int_ty = llvm::IntegerType::get(Ctx, bit_width);
-  auto *i64_ty = llvm::Type::getInt64Ty(Ctx);
+  auto *i16_ty = llvm::Type::getInt16Ty(Ctx);
+
+  // Truncate the 64-bit port address to i16 (x86 I/O port space is 16-bit).
+  auto *port = Builder.CreateTrunc(CI->getArgOperand(1), i16_ty);
 
   if (is_read) {
-    auto *FT = llvm::FunctionType::get(int_ty, {i64_ty}, false);
-    std::string name = "__omill_read_io_port_" + std::to_string(bit_width);
-    auto callee = getOrDeclareHelper(M, name, FT);
-    auto *result = Builder.CreateCall(callee, {CI->getArgOperand(1)});
+    // in al/ax/eax, dx
+    const char *asm_str = (bit_width == 8)  ? "in al, dx" :
+                          (bit_width == 16) ? "in ax, dx" :
+                                              "in eax, dx";
+    auto *asm_ty = llvm::FunctionType::get(int_ty, {i16_ty}, false);
+    auto *ia = llvm::InlineAsm::get(asm_ty, asm_str,
+                                    "={ax},{dx},~{dirflag},~{fpsr},~{flags}",
+                                    /*hasSideEffects=*/true);
+    auto *result = Builder.CreateCall(ia, {port});
     CI->replaceAllUsesWith(result);
   } else {
+    // out dx, al/ax/eax
+    const char *asm_str = (bit_width == 8)  ? "out dx, al" :
+                          (bit_width == 16) ? "out dx, ax" :
+                                              "out dx, eax";
+    auto *val = CI->getArgOperand(2);
     auto *void_ty = llvm::Type::getVoidTy(Ctx);
-    auto *FT = llvm::FunctionType::get(void_ty, {i64_ty, int_ty}, false);
-    std::string name = "__omill_write_io_port_" + std::to_string(bit_width);
-    auto callee = getOrDeclareHelper(M, name, FT);
-    Builder.CreateCall(callee, {CI->getArgOperand(1), CI->getArgOperand(2)});
+    auto *asm_ty = llvm::FunctionType::get(void_ty, {i16_ty, int_ty}, false);
+    auto *ia = llvm::InlineAsm::get(asm_ty, asm_str,
+                                    "{dx},{ax},~{dirflag},~{fpsr},~{flags}",
+                                    /*hasSideEffects=*/true);
+    Builder.CreateCall(ia, {port, val});
+    // Write intrinsic returns Memory* — replace with input Memory* (arg 0).
     CI->replaceAllUsesWith(CI->getArgOperand(0));
   }
   CI->eraseFromParent();

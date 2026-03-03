@@ -1,11 +1,13 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/IR/PassTimingInfo.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/Linker/Linker.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/InitLLVM.h>
@@ -111,6 +113,11 @@ static cl::opt<std::string> VMEntry(
 static cl::opt<std::string> VMExit(
     "vm-exit",
     cl::desc("VM exit (vmexit) function VA for VM devirtualization (hex)"));
+
+static cl::opt<bool> OmillTimePasses(
+    "omill-time-passes",
+    cl::desc("Time each omill pass, printing elapsed time on exit"),
+    cl::init(false));
 
 namespace {
 
@@ -646,8 +653,13 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Set up pass timing instrumentation.
+  PassInstrumentationCallbacks PIC;
+  TimePassesHandler TimingHandler(OmillTimePasses);
+  TimingHandler.registerCallbacks(PIC);
+
   // Set up pass infrastructure
-  PassBuilder PB;
+  PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
@@ -1098,6 +1110,9 @@ int main(int argc, char **argv) {
       errs() << "Late discovery round " << (round + 1) << " complete\n";
     }
   }
+
+  if (OmillTimePasses)
+    TimingHandler.print();
 
   // Verify
   if (verifyModule(*module, &errs())) {

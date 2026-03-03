@@ -779,11 +779,18 @@ mc_done:
 /// and the result is a valid address in the binary.
 static std::optional<uint64_t>
 tryMonteCarloResolve(llvm::Value *V, llvm::Function &F,
-                     const BinaryMemoryMap *BMM) {
+                     const BinaryMemoryMap *BMM,
+                     const MCStoreMap *CachedSSM = nullptr) {
   constexpr unsigned NumTrials = 32;
   const llvm::DataLayout &DL = F.getDataLayout();
 
-  MCStoreMap SSM = buildMCStoreMap(F, DL);
+  // Use the cached store map if provided, otherwise build one.
+  MCStoreMap LocalSSM;
+  if (!CachedSSM) {
+    LocalSSM = buildMCStoreMap(F, DL);
+    CachedSSM = &LocalSSM;
+  }
+  const MCStoreMap &SSM = *CachedSSM;
 
   // Collect all allocas for base assignment.
   llvm::SmallVector<llvm::AllocaInst *, 8> AllAllocas;
@@ -1571,6 +1578,11 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
   if (candidates.empty())
     return llvm::PreservedAnalyses::all();
 
+  // Build the store map once for the entire function — tryMonteCarloResolve
+  // would otherwise rebuild it for each unresolved dispatch candidate.
+  const llvm::DataLayout &DL = F.getDataLayout();
+  MCStoreMap SSM = buildMCStoreMap(F, DL);
+
   bool changed = false;
 
   for (auto &cand : candidates) {
@@ -1580,7 +1592,7 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // handler MBA with symbolic operands that cancel out), try concrete
     // evaluation with random values for unknowns.
     if (!resolved)
-      resolved = tryMonteCarloResolve(target, F, map);
+      resolved = tryMonteCarloResolve(target, F, map, &SSM);
     // Forward interpreter fallback: if backward MC fails (cross-BB
     // inttoptr stores that the backward evaluator can't forward), walk
     // the function forward, tracking stores/loads through virtual memory.

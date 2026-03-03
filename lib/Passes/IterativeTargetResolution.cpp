@@ -1,5 +1,6 @@
 #include "omill/Passes/IterativeTargetResolution.h"
 
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
@@ -38,6 +39,20 @@ namespace omill {
 
 namespace {
 
+/// Check if a function contains any unresolved dispatch calls.
+bool hasUnresolvedDispatches(llvm::Function &F) {
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I))
+        if (auto *callee = call->getCalledFunction()) {
+          auto name = callee->getName();
+          if (name == "__omill_dispatch_call" ||
+              name == "__omill_dispatch_jump")
+            return true;
+        }
+  return false;
+}
+
 /// Count unresolved __omill_dispatch_call and __omill_dispatch_jump calls.
 unsigned countUnresolvedDispatches(llvm::Module &M) {
   unsigned count = 0;
@@ -57,6 +72,33 @@ unsigned countUnresolvedDispatches(llvm::Module &M) {
     }
   }
   return count;
+}
+
+/// Collect the set of functions containing unresolved dispatch calls.
+llvm::SmallVector<llvm::Function *, 16>
+collectAffectedFunctions(llvm::Module &M) {
+  llvm::SmallVector<llvm::Function *, 16> result;
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (hasUnresolvedDispatches(F))
+      result.push_back(&F);
+  }
+  return result;
+}
+
+/// Run a FunctionPassManager on a specific set of functions.
+void runFPMOnFunctions(llvm::FunctionPassManager &FPM,
+                       llvm::ArrayRef<llvm::Function *> Funcs,
+                       llvm::ModuleAnalysisManager &MAM,
+                       llvm::Module &M) {
+  llvm::FunctionAnalysisManager &FAM =
+      MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+  for (auto *F : Funcs) {
+    if (F->isDeclaration())
+      continue;
+    FPM.run(*F, FAM);
+  }
 }
 
 /// Collect constant dispatch targets that don't have a corresponding lifted
@@ -302,7 +344,13 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
   do {
     lifted_new_funcs = false;  // Reset each iteration.
+
+    // Collect functions with unresolved dispatches — only these need
+    // the expensive optimization passes in Step 1.
+    auto affected = collectAffectedFunctions(M);
+
     // Step 1: CFG canonicalization + LLVM optimizations.
+    // Run only on functions with unresolved dispatches, not the entire module.
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(llvm::FixIrreduciblePass());
@@ -315,11 +363,11 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(ConstantMemoryFoldingPass());
       FPM.addPass(EliminateDeadPathsPass());
       FPM.addPass(llvm::InstCombinePass());
-      auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-      adaptor.run(M, MAM);
+      runFPMOnFunctions(FPM, affected, MAM, M);
     }
 
     // Step 2a: Resolve dispatch targets (but don't lower yet).
+    // Only run on affected functions — resolvers early-exit on others anyway.
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(ResolveAndLowerControlFlowPass());
@@ -327,8 +375,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 #if OMILL_ENABLE_Z3
       FPM.addPass(Z3DispatchSolverPass());
 #endif
-      auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-      adaptor.run(M, MAM);
+      runFPMOnFunctions(FPM, affected, MAM, M);
     }
 
     // Step 2b: If we have a lift callback, discover constant dispatch targets
@@ -471,11 +518,11 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     }
 
     // Step 2c: Lower resolved dispatches.
+    // Only run on affected functions — only they can have resolved dispatches.
     {
       llvm::FunctionPassManager FPM;
       FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
-      auto adaptor = llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-      adaptor.run(M, MAM);
+      runFPMOnFunctions(FPM, affected, MAM, M);
     }
 
     unsigned curr_count = countUnresolvedDispatches(M);
@@ -505,6 +552,9 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           // and IndirectCallResolver's Monte Carlo evaluator picks up
           // the folded dispatch targets in the next iteration.
           {
+            // Only run on functions with dispatches — those are the ones
+            // that had callees inlined into them.
+            auto post_inline = collectAffectedFunctions(M);
             llvm::FunctionPassManager FPM;
             FPM.addPass(RecoverAllocaPointersPass());
             FPM.addPass(llvm::GVNPass());
@@ -512,11 +562,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             FPM.addPass(llvm::InstCombinePass());
             FPM.addPass(llvm::SimplifyCFGPass());
             FPM.addPass(llvm::ADCEPass());
-            FPM.addPass(llvm::SimplifyCFGPass());
             FPM.addPass(llvm::InstCombinePass());
-            auto adaptor =
-                llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-            adaptor.run(M, MAM);
+            runFPMOnFunctions(FPM, post_inline, MAM, M);
           }
 
           // Re-fetch the lifted map after invalidation.
@@ -571,7 +618,10 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           // Phase A: Collapse SHR switches from the inlined handler,
           // then promote State fields to allocas so stores are visible
           // to SROA/GVN without inttoptr aliasing barriers.
+          // Only run on functions with dispatches (callers that received
+          // the reverse-inlined handler bodies).
           {
+            auto post_reverse = collectAffectedFunctions(M);
             llvm::FunctionPassManager FPM;
             FPM.addPass(CollapseRemillSHRSwitchPass());
             FPM.addPass(llvm::SimplifyCFGPass());
@@ -579,13 +629,12 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             FPM.addPass(OptimizeStatePass(OptimizePhases::All));
             FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
             FPM.addPass(llvm::InstCombinePass());
-            auto adaptor =
-                llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-            adaptor.run(M, MAM);
+            runFPMOnFunctions(FPM, post_reverse, MAM, M);
           }
 
           // Phase B: Standard cleanup with constant folding.
           {
+            auto post_reverse = collectAffectedFunctions(M);
             llvm::FunctionPassManager FPM;
             FPM.addPass(RecoverAllocaPointersPass());
             FPM.addPass(llvm::GVNPass());
@@ -593,11 +642,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
             FPM.addPass(llvm::InstCombinePass());
             FPM.addPass(llvm::SimplifyCFGPass());
             FPM.addPass(llvm::ADCEPass());
-            FPM.addPass(llvm::SimplifyCFGPass());
             FPM.addPass(llvm::InstCombinePass());
-            auto adaptor =
-                llvm::createModuleToFunctionPassAdaptor(std::move(FPM));
-            adaptor.run(M, MAM);
+            runFPMOnFunctions(FPM, post_reverse, MAM, M);
           }
 
           lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
