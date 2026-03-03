@@ -31,6 +31,7 @@
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/VMHandlerGraph.h"
 #include "omill/Omill.h"
 
 #include <deque>
@@ -102,6 +103,14 @@ static cl::opt<bool> DumpIR(
     "dump-ir",
     cl::desc("Dump before/after IR to before.ll, after.ll, after_abi.ll"),
     cl::init(false));
+
+static cl::opt<std::string> VMEntry(
+    "vm-entry",
+    cl::desc("VM entry (vmenter) function VA for VM devirtualization (hex)"));
+
+static cl::opt<std::string> VMExit(
+    "vm-exit",
+    cl::desc("VM exit (vmexit) function VA for VM devirtualization (hex)"));
 
 namespace {
 
@@ -445,6 +454,28 @@ int main(int argc, char **argv) {
   }
   errs() << "Lifting function at VA 0x" << Twine::utohexstr(func_va) << "\n";
 
+  // Parse VM entry/exit VAs if provided.
+  uint64_t vm_entry_va = 0, vm_exit_va = 0;
+  auto parseHexOpt = [](const std::string &s) -> uint64_t {
+    uint64_t v = 0;
+    StringRef sr(s);
+    if (sr.starts_with("0x") || sr.starts_with("0X"))
+      sr.drop_front(2).getAsInteger(16, v);
+    else
+      sr.getAsInteger(16, v);
+    return v;
+  };
+  if (VMEntry.getNumOccurrences() > 0)
+    vm_entry_va = parseHexOpt(VMEntry);
+  if (VMExit.getNumOccurrences() > 0)
+    vm_exit_va = parseHexOpt(VMExit);
+
+  bool vm_mode = (vm_entry_va != 0);
+  if (vm_mode) {
+    errs() << "VM mode: vmenter=0x" << Twine::utohexstr(vm_entry_va)
+           << " vmexit=0x" << Twine::utohexstr(vm_exit_va) << "\n";
+  }
+
   // --- Raw binary mode ---
   PEInfo pe;
   std::vector<uint8_t> raw_code;
@@ -536,6 +567,76 @@ int main(int argc, char **argv) {
   }
   errs() << "Lifting complete\n";
 
+  // VM mode: build handler graph and bulk-lift all discovered handlers.
+  std::shared_ptr<omill::VMHandlerGraph> vm_graph;
+  if (vm_mode && !RawBinary) {
+    vm_graph = std::make_shared<omill::VMHandlerGraph>(
+        pe.memory_map, pe.image_base, vm_entry_va, vm_exit_va);
+
+    errs() << "VM handler graph: " << vm_graph->handlerEntries().size()
+           << " handlers, " << vm_graph->numDispatchSites()
+           << " dispatch sites\n";
+
+    // Lift all discovered handler entry VAs.
+    unsigned lifted_count = 0;
+    unsigned failed_count = 0;
+    for (uint64_t handler_va : vm_graph->handlerEntries()) {
+      // Skip if already lifted (e.g. func_va or vmenter/vmexit).
+      std::string name = "sub_" + Twine::utohexstr(handler_va).str();
+      if (auto *existing = module->getFunction(name)) {
+        if (!existing->isDeclaration()) {
+          // Tag existing function as a VM handler.
+          existing->addFnAttr("omill.vm_handler");
+          continue;
+        }
+      }
+
+      if (lifter.Lift(handler_va)) {
+        ++lifted_count;
+        // Tag the lifted function.
+        if (auto *fn = module->getFunction(name))
+          fn->addFnAttr("omill.vm_handler");
+      } else {
+        ++failed_count;
+      }
+    }
+
+    errs() << "VM bulk lift: " << lifted_count << " handlers lifted";
+    if (failed_count > 0)
+      errs() << ", " << failed_count << " failed";
+    errs() << "\n";
+
+    // Also tag vmenter/vmexit.
+    if (auto *fn = module->getFunction(
+            "sub_" + Twine::utohexstr(vm_entry_va).str()))
+      fn->addFnAttr("omill.vm_handler");
+    if (vm_exit_va != 0) {
+      if (auto *fn = module->getFunction(
+              "sub_" + Twine::utohexstr(vm_exit_va).str()))
+        fn->addFnAttr("omill.vm_handler");
+    }
+
+    // Fix DeclareLiftedFunction naming collisions (sub_X.N → sub_X).
+    for (auto &F : llvm::make_early_inc_range(*module)) {
+      if (!F.isDeclaration())
+        continue;
+      auto fname = F.getName();
+      if (!fname.starts_with("sub_"))
+        continue;
+      for (int i = 1; i <= 20; ++i) {
+        std::string def_name = (fname + "." + Twine(i)).str();
+        if (auto *def = module->getFunction(def_name)) {
+          if (!def->isDeclaration()) {
+            F.replaceAllUsesWith(def);
+            F.eraseFromParent();
+            def->setName(fname);
+            break;
+          }
+        }
+      }
+    }
+  }
+
   if (DumpIR) {
     std::error_code ec;
     raw_fd_ostream os("before.ll", ec, sys::fs::OF_Text);
@@ -598,6 +699,15 @@ int main(int argc, char **argv) {
     MAM.registerPass([&] { return omill::ExceptionInfoAnalysis(); });
   }
 
+  // Register VM handler graph analysis if in VM mode.
+  if (vm_graph) {
+    MAM.registerPass([vm_graph] {
+      return omill::VMHandlerGraphAnalysis(*vm_graph);
+    });
+  } else {
+    MAM.registerPass([&] { return omill::VMHandlerGraphAnalysis(); });
+  }
+
   // Register trace-lift callback so IterativeTargetResolutionPass can
   // lift new functions from resolved dispatch targets.
   {
@@ -655,6 +765,7 @@ int main(int argc, char **argv) {
   opts.refine_signatures = RefineSignatures;
   opts.interprocedural_const_prop = IPCP;
   opts.use_block_lifting = BlockLift;
+  opts.vm_devirtualize = vm_mode;
   {
     ModulePassManager MPM;
     omill::buildPipeline(MPM, opts);

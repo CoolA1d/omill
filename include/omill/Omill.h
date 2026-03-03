@@ -45,6 +45,11 @@ struct PipelineOptions {
   /// Opt-in; runs late in Phase 4 after ABI recovery.
   bool refine_signatures = false;
 
+  /// VM devirtualization: resolve dispatch targets and eliminate hash integrity
+  /// checks for EAC-style hash-threaded interpreter VMs.  Requires
+  /// VMHandlerGraphAnalysis to be registered.
+  bool vm_devirtualize = false;
+
   /// Use the blocks-as-functions lifting architecture instead of TraceLifter.
   /// When enabled, the pipeline inserts IterativeBlockDiscoveryPass and
   /// MergeBlockFunctionsPass instead of IterativeTargetResolutionPass.

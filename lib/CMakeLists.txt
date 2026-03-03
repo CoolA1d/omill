@@ -20,6 +20,11 @@ add_library(omill STATIC
   Passes/OptimizeState.cpp
   Passes/MemoryPointerElimination.cpp
 
+  # Passes - Stage 2.5: VM Devirtualization
+  Analysis/VMHandlerGraph.cpp
+  Passes/VMDispatchResolution.cpp
+  Passes/VMHashElimination.cpp
+
   # Passes - Stage 4: Control Flow Recovery
   Passes/ResolveForcedExceptions.cpp
   Passes/CFGRecovery.cpp

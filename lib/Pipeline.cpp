@@ -72,6 +72,9 @@
 #include "omill/Passes/StackConcretization.h"
 #include "omill/Passes/TypeRecovery.h"
 #include "omill/Passes/VMHandlerInliner.h"
+#include "omill/Analysis/VMHandlerGraph.h"
+#include "omill/Passes/VMDispatchResolution.h"
+#include "omill/Passes/VMHashElimination.h"
 #include "omill/Passes/RewriteLiftedCallsToNative.h"
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
@@ -993,6 +996,43 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // Phase 3.56: VM Devirtualization.
+  // Resolve handler dispatch targets via binary graph lookup and eliminate
+  // hash integrity checks.  Must run after Phase 3 has lowered __remill_jump
+  // to __omill_dispatch_jump and before Phase 3.6 resolves them.
+  if (opts.vm_devirtualize) {
+    // Resolve opaque dispatch targets using the handler graph.
+    MPM.addPass(VMDispatchResolutionPass());
+
+    // Eliminate hash integrity checks in handler functions.
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(VMHashEliminationPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+
+    // Resolve newly-constant dispatch targets and inline small handlers.
+    MPM.addPass(VMHandlerInlinerPass(/*max_handler_instrs=*/500,
+                                     /*min_callsites=*/1));
+    MPM.addPass(llvm::AlwaysInlinerPass());
+
+    // Clean up after handler inlining.
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+      FPM.addPass(RecoverAllocaPointersPass());
+      FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(llvm::GVNPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
   // Phase 3.6: Iterative indirect target resolution.
   if (opts.use_block_lifting) {
     // Block-lifting mode: optimize block-functions, resolve constant
@@ -1093,6 +1133,7 @@ void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return LiftedFunctionAnalysis(); });
   MAM.registerPass([&] { return ExceptionInfoAnalysis(); });
   MAM.registerPass([&] { return BlockLiftAnalysis(); });
+  MAM.registerPass([&] { return VMHandlerGraphAnalysis(); });
 }
 
 void registerAAWithManager(llvm::AAManager &AAM) {
