@@ -131,6 +131,12 @@ static cl::opt<std::string> TraceFunc(
     cl::desc("Print block/instruction counts for a named function after each "
              "omill pass (e.g. sub_1800444a0)"));
 
+static cl::opt<bool> DumpFuncPhases(
+    "dump-func-phases",
+    cl::desc("With --trace-func, dump the function's IR to files at each "
+             "phase marker and on large instruction drops (>30%)"),
+    cl::init(false));
+
 static cl::opt<std::string> ScanSection(
     "scan-section",
     cl::desc("Scan a PE section and output function classification as JSON"));
@@ -1055,9 +1061,28 @@ int main(int argc, char **argv) {
     std::string target_native = target_base + "_native";
     unsigned prev_blocks = 0, prev_insts = 0;
     unsigned prev_blocks_n = 0, prev_insts_n = 0;
+    unsigned dump_seq = 0;
+
+    // Helper: dump function IR to a file for post-mortem analysis.
+    auto dumpFuncIR = [&](const Function *F, StringRef reason,
+                          unsigned seq) {
+      if (!DumpFuncPhases || !F || F->isDeclaration())
+        return;
+      std::string filename = (F->getName() + ".phase" +
+                              llvm::Twine(seq) + ".ll").str();
+      std::error_code EC;
+      llvm::raw_fd_ostream OS(filename, EC);
+      if (EC) return;
+      OS << "; " << reason << "\n";
+      F->print(OS);
+      errs() << "[TRACE] dumped " << F->getName() << " → " << filename
+             << " (" << reason << ")\n";
+    };
+
     PIC.registerAfterPassCallback(
         [=, &prev_blocks, &prev_insts,
-         &prev_blocks_n, &prev_insts_n](
+         &prev_blocks_n, &prev_insts_n,
+         &dump_seq, &dumpFuncIR](
             StringRef PassName, Any IR, const PreservedAnalyses &) mutable {
           const Module *M = nullptr;
           if (const auto **F = any_cast<const Function *>(&IR))
@@ -1087,16 +1112,28 @@ int main(int argc, char **argv) {
               insts += BB.size();
             }
             if (blocks != pb || insts != pi) {
+              int di = (pi > 0) ? (int)insts - (int)pi : 0;
               errs() << "[TRACE] " << PassName << " | " << name
                      << ": " << blocks << " blocks, " << insts
                      << " instrs";
               if (pb != 0) {
                 int db = (int)blocks - (int)pb;
-                int di = (int)insts - (int)pi;
                 errs() << " (delta: " << db << " blocks, "
                        << di << " instrs)";
               }
               errs() << "\n";
+
+              // Dump IR on large drops (>30% instruction loss) or phase markers.
+              bool is_phase = PassName.contains("PhaseMarker");
+              bool large_drop = pi > 0 && di < 0 &&
+                                (unsigned)(-di) > pi * 3 / 10;
+              if (DumpFuncPhases && (is_phase || large_drop)) {
+                std::string reason = (PassName + " | " +
+                    llvm::Twine(blocks) + "bb/" +
+                    llvm::Twine(insts) + "i").str();
+                dumpFuncIR(F, reason, dump_seq++);
+              }
+
               pb = blocks;
               pi = insts;
             }

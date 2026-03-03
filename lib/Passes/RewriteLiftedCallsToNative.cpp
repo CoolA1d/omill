@@ -418,8 +418,12 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
           auto *result = Builder.CreateCall(fn_ty, fn_ptr,
                                             {rcx, rdx, r8, r9},
                                             "jump.result");
-          llvm::cast<llvm::CallInst>(result)->setTailCallKind(
-              llvm::CallInst::TCK_Tail);
+          // NOTE: Do NOT mark as tail call.  'tail' implies the callee
+          // does not access caller allocas.  After inlining into _native,
+          // the State struct and native stack become local allocas.  The
+          // 'tail' marker would tell LLVM these calls don't touch those
+          // allocas, causing alias analysis to consider State/stack stores
+          // dead and eliminating the function body.
 
           buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
         } else {
@@ -441,10 +445,9 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
           auto *result = Builder.CreateCall(fn_ty, fn_ptr,
                                             {rcx, rdx, r8, r9},
                                             "indirect.result");
-          // This call is not structurally in tail position in many lifted
-          // functions, so using musttail here can produce invalid IR.
-          llvm::cast<llvm::CallInst>(result)->setTailCallKind(
-              llvm::CallInst::TCK_Tail);
+          // NOTE: Do NOT mark as tail call.  Same reason as above: 'tail'
+          // implies no alloca access, which is wrong after inlining into
+          // _native where State/stack are local allocas.
 
           buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
         }
