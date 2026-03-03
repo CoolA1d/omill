@@ -10,6 +10,7 @@ set(OMILL_LLVM_COMPONENTS
   IRPrinter
   BitReader
   BitWriter
+  Linker
   Passes
   Analysis
   TransformUtils

@@ -309,6 +309,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
       FPM.addPass(llvm::LoopSimplifyPass());
       FPM.addPass(llvm::LCSSAPass());
       FPM.addPass(llvm::InstCombinePass());
+      FPM.addPass(ConstantMemoryFoldingPass());
       FPM.addPass(llvm::GVNPass());
       FPM.addPass(llvm::SimplifyCFGPass());
       FPM.addPass(ConstantMemoryFoldingPass());

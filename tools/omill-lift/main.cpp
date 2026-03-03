@@ -3,6 +3,7 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/BinaryFormat/COFF.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CommandLine.h>
@@ -115,9 +116,17 @@ class BufferTraceManager : public omill::TraceManager {
   void setBaseAddr(uint64_t addr) { base_addr_ = addr; }
   uint64_t baseAddr() const { return base_addr_; }
 
+  /// Must be called after the module and arch are created so that
+  /// shallow-lift mode can create proper function declarations.
+  void setModuleAndArch(llvm::Module *m, const remill::Arch *a) {
+    module_ = m;
+    arch_ = a;
+  }
+
   void SetLiftedTraceDefinition(uint64_t addr,
                                 llvm::Function *func) override {
     lifted_[addr] = func;
+    ++lift_count_;
   }
 
   llvm::Function *GetLiftedTraceDeclaration(uint64_t addr) override {
@@ -126,8 +135,26 @@ class BufferTraceManager : public omill::TraceManager {
   }
 
   llvm::Function *GetLiftedTraceDefinition(uint64_t addr) override {
+    // In shallow mode, report all addresses outside the root set as
+    // "already lifted" to prevent recursive lifting of the entire
+    // call graph.  This is used for late target discovery where we
+    // only need the target function, not its callees.
+    if (max_lift_count_ > 0 && lift_count_ >= max_lift_count_) {
+      auto it = lifted_.find(addr);
+      if (it != lifted_.end())
+        return it->second;
+      // Create a real declaration so the TraceLifter can safely
+      // dereference the returned pointer (it checks getParent()).
+      auto *decl = arch_->DeclareLiftedFunction(TraceName(addr), module_);
+      lifted_[addr] = decl;
+      return decl;
+    }
     return GetLiftedTraceDeclaration(addr);
   }
+
+  /// Set maximum number of traces to lift per Lift() call.  0 = unlimited.
+  void setMaxLiftCount(unsigned n) { max_lift_count_ = n; }
+  void resetLiftCount() { lift_count_ = 0; }
 
   bool TryReadExecutableByte(uint64_t addr, uint8_t *out) override {
     for (auto &[base, data] : code_) {
@@ -143,6 +170,10 @@ class BufferTraceManager : public omill::TraceManager {
   std::map<uint64_t, std::vector<uint8_t>> code_;
   std::map<uint64_t, llvm::Function *> lifted_;
   uint64_t base_addr_ = 0;
+  unsigned max_lift_count_ = 0;
+  unsigned lift_count_ = 0;
+  llvm::Module *module_ = nullptr;
+  const remill::Arch *arch_ = nullptr;
 };
 
 /// In-memory block manager for block-lifting mode.
@@ -463,6 +494,7 @@ int main(int argc, char **argv) {
 
   // Load code into the trace manager.
   BufferTraceManager manager;
+  manager.setModuleAndArch(module.get(), arch.get());
   if (RawBinary) {
     manager.setCode(raw_code.data(), raw_code.size(), BaseAddress);
   } else {
@@ -645,6 +677,169 @@ int main(int argc, char **argv) {
     omill::buildABIRecoveryPipeline(MPM);
     MPM.run(*module, MAM);
     errs() << "ABI recovery complete\n";
+  }
+
+  // Late target discovery: after ABI recovery folds MBA chains (via
+  // EliminateStateStruct + RecoverStackFrame + SROA + GVN), scan for
+  // constant inttoptr call targets that point to unlifted code addresses.
+  // Lift them into a FRESH semantics module (the main module's remill
+  // state was destroyed by the pipeline), run the pipeline + ABI on it,
+  // then link the resulting _native functions back into the main module.
+  if (ResolveTargets && !NoABI) {
+    for (unsigned round = 0; round < 3; ++round) {
+      // Collect constant inttoptr call targets.
+      llvm::DenseSet<uint64_t> late_targets;
+      for (auto &F : *module) {
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->getCalledFunction())
+              continue;
+            auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(
+                call->getCalledOperand());
+            if (!ce || ce->getOpcode() != llvm::Instruction::IntToPtr)
+              continue;
+            auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+            if (!ci)
+              continue;
+            uint64_t target = ci->getZExtValue();
+            if (target == 0)
+              continue;
+            bool in_code = false;
+            if (RawBinary) {
+              in_code = (target >= BaseAddress &&
+                         target < BaseAddress + raw_code.size());
+            } else {
+              for (auto &sec : pe.code_sections) {
+                if (target >= sec.va && target < sec.va + sec.size) {
+                  in_code = true;
+                  break;
+                }
+              }
+            }
+            if (!in_code)
+              continue;
+            std::string name = "sub_" + llvm::Twine::utohexstr(target).str();
+            if (module->getFunction(name) ||
+                module->getFunction(name + "_native"))
+              continue;
+            late_targets.insert(target);
+          }
+        }
+      }
+
+      if (late_targets.empty())
+        break;
+
+      errs() << "Late discovery round " << (round + 1) << ": "
+             << late_targets.size() << " new target(s)\n";
+
+      // Load fresh arch + semantics for lifting (the main module's
+      // remill ISEL stubs and intrinsics were deleted by the pipeline).
+      auto late_arch =
+          remill::Arch::Get(ctx, os_name, remill::kArchAMD64_AVX);
+      auto late_module = remill::LoadArchSemantics(late_arch.get());
+
+      BufferTraceManager late_manager;
+      late_manager.setModuleAndArch(late_module.get(), late_arch.get());
+      if (RawBinary) {
+        late_manager.setCode(raw_code.data(), raw_code.size(), BaseAddress);
+      } else {
+        for (const auto &cs : pe.code_sections) {
+          auto &stored = pe.section_storage[cs.storage_index];
+          late_manager.setCode(stored.data(), stored.size(), cs.va);
+        }
+      }
+
+      omill::TraceLifter late_lifter(late_arch.get(), late_manager);
+
+      // Shallow-lift: only the target function, not its callee graph.
+      late_manager.setMaxLiftCount(1);
+      for (uint64_t pc : late_targets) {
+        late_manager.resetLiftCount();
+        late_lifter.Lift(pc);
+      }
+      late_manager.setMaxLiftCount(0);
+
+      // Run the pipeline on the fresh module.
+      {
+        PassBuilder late_PB;
+        LoopAnalysisManager late_LAM;
+        FunctionAnalysisManager late_FAM;
+        CGSCCAnalysisManager late_CGAM;
+        ModuleAnalysisManager late_MAM;
+
+        late_FAM.registerPass([&late_PB] {
+          auto AAM = late_PB.buildDefaultAAPipeline();
+          omill::registerAAWithManager(AAM);
+          return AAM;
+        });
+        late_PB.registerModuleAnalyses(late_MAM);
+        late_PB.registerCGSCCAnalyses(late_CGAM);
+        late_PB.registerFunctionAnalyses(late_FAM);
+        late_PB.registerLoopAnalyses(late_LAM);
+        late_PB.crossRegisterProxies(late_LAM, late_FAM, late_CGAM,
+                                     late_MAM);
+        omill::registerAnalyses(late_FAM);
+
+        late_MAM.registerPass([memory_map_holder] {
+          return omill::BinaryMemoryAnalysis(*memory_map_holder);
+        });
+        late_MAM.registerPass([&] {
+          return omill::CallingConventionAnalysis();
+        });
+        late_MAM.registerPass([&] {
+          return omill::CallGraphAnalysis();
+        });
+        late_MAM.registerPass([&] {
+          return omill::LiftedFunctionAnalysis();
+        });
+        late_MAM.registerPass([&] {
+          return omill::ExceptionInfoAnalysis();
+        });
+        late_MAM.registerPass([] {
+          return omill::TraceLiftAnalysis(omill::TraceLiftCallback{});
+        });
+
+        omill::PipelineOptions late_opts = opts;
+        late_opts.resolve_indirect_targets = false;
+        {
+          ModulePassManager MPM;
+          omill::buildPipeline(MPM, late_opts);
+          MPM.run(*late_module, late_MAM);
+        }
+        {
+          ModulePassManager MPM;
+          omill::buildABIRecoveryPipeline(MPM);
+          MPM.run(*late_module, late_MAM);
+        }
+      }
+
+      // Link the late module into the main module.  Linker replaces
+      // declarations with definitions and handles type merging.
+      if (llvm::Linker::linkModules(*module, std::move(late_module))) {
+        errs() << "WARNING: linking late module failed\n";
+        break;
+      }
+
+      // Patch call sites: replace inttoptr(i64 <const>) → @sub_<hex>_native
+      for (uint64_t pc : late_targets) {
+        std::string native_name =
+            "sub_" + llvm::Twine::utohexstr(pc).str() + "_native";
+        auto *target_fn = module->getFunction(native_name);
+        if (!target_fn)
+          continue;
+        auto *pc_ci = llvm::ConstantInt::get(
+            llvm::Type::getInt64Ty(ctx), pc);
+        auto *itp = llvm::ConstantExpr::getIntToPtr(
+            pc_ci, llvm::PointerType::getUnqual(ctx));
+        // Replace all uses of inttoptr(pc) with the function pointer.
+        if (itp->getNumUses() > 0)
+          itp->replaceAllUsesWith(target_fn);
+      }
+
+      errs() << "Late discovery round " << (round + 1) << " complete\n";
+    }
   }
 
   // Verify

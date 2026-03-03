@@ -1433,8 +1433,18 @@ bool resolveDispatchJump(llvm::CallInst *call, uint64_t resolved_pc,
                          const LiftedFunctionMap *lifted) {
   auto *F = call->getFunction();
 
-  // Must be followed by ret.
-  auto *ret = llvm::dyn_cast<llvm::ReturnInst>(call->getNextNode());
+  // Find the ret following the dispatch call, skipping intermediate
+  // instructions (insertvalue chains from struct returns, etc.).
+  llvm::ReturnInst *ret = nullptr;
+  for (auto *N = call->getNextNode(); N; N = N->getNextNode()) {
+    if (auto *R = llvm::dyn_cast<llvm::ReturnInst>(N)) {
+      ret = R;
+      break;
+    }
+    // Stop at terminators or side-effectful instructions.
+    if (N->isTerminator() || N->mayHaveSideEffects())
+      break;
+  }
   if (!ret)
     return false;
 
@@ -1503,6 +1513,9 @@ bool resolveDispatchJump(llvm::CallInst *call, uint64_t resolved_pc,
   }
 
   // Priority 3: Replace target with constant for downstream passes.
+  // For jumps, only accept if there's a trace-lift callback that can
+  // discover the target — otherwise an MC-mispredicted constant would
+  // be lowered to inttoptr(wrong_addr) with no recovery path.
   auto *i64_ty = llvm::Type::getInt64Ty(call->getContext());
   call->setArgOperand(1, llvm::ConstantInt::get(i64_ty, resolved_pc));
   return true;
@@ -1571,10 +1584,37 @@ llvm::PreservedAnalyses IndirectCallResolverPass::run(
     // Forward interpreter fallback: if backward MC fails (cross-BB
     // inttoptr stores that the backward evaluator can't forward), walk
     // the function forward, tracking stores/loads through virtual memory.
-    if (!resolved)
+    // Forward MC fallback: if backward MC fails (cross-BB inttoptr stores
+    // that the backward evaluator can't forward), walk the function
+    // forward, tracking stores/loads through virtual memory.
+    bool from_fwd_mc = false;
+    if (!resolved) {
       resolved = tryForwardMonteCarloResolve(cand.call, F, map);
+      from_fwd_mc = resolved.has_value();
+    }
     if (!resolved)
       continue;
+
+    // Forward MC results are less reliable than deterministic evaluation
+    // or backward MC — they can give wrong-but-consistent results when
+    // they mismodel an instruction.  Only accept forward MC results that
+    // resolve to a *known* destination (lifted function, intra-function
+    // block, or IAT import).  Unknown targets are skipped — the main
+    // pipeline's standard passes (GVN/InstCombine) may fold the MBA
+    // correctly in a later phase.
+    if (from_fwd_mc) {
+      uint64_t rpc = *resolved;
+      bool known = false;
+      if (lifted && lifted->lookup(rpc))
+        known = true;
+      if (!known && findBlockForPC(F, rpc))
+        known = true;
+      if (!known && map && map->hasImports() && map->lookupImport(rpc))
+        known = true;
+      if (!known)
+        continue;
+    }
+
     if (cand.is_jump) {
       changed |= resolveDispatchJump(cand.call, *resolved, lifted);
     } else {
