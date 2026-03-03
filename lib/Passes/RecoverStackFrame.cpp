@@ -10,8 +10,19 @@
 #include <llvm/IR/Operator.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace omill {
+
+namespace {
+/// Check if stack frame debug output is enabled via OMILL_DEBUG_STACK_FRAME.
+bool debugStackFrame() {
+  static int enabled = -1;
+  if (enabled < 0)
+    enabled = std::getenv("OMILL_DEBUG_STACK_FRAME") ? 1 : 0;
+  return enabled != 0;
+}
+}  // namespace
 
 namespace {
 
@@ -385,8 +396,15 @@ llvm::PreservedAnalyses RecoverStackFramePass::run(
 
   auto base_values = findStackBaseValues(F);
   if (base_values.empty()) {
+    if (debugStackFrame())
+      llvm::errs() << "[RSF] " << F.getName()
+                   << ": no stack base values found\n";
     return llvm::PreservedAnalyses::all();
   }
+
+  if (debugStackFrame())
+    llvm::errs() << "[RSF] " << F.getName() << ": found "
+                 << base_values.size() << " base value(s)\n";
 
   llvm::IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
   auto *i8_ty = EntryBuilder.getInt8Ty();
@@ -411,16 +429,39 @@ llvm::PreservedAnalyses RecoverStackFramePass::run(
       }
     }
 
-    bool is_phi_base = llvm::isa<llvm::PHINode>(base);
+    if (debugStackFrame()) {
+      llvm::errs() << "[RSF]   base: ";
+      base->printAsOperand(llvm::errs(), false);
+      llvm::errs() << " (" << offsets.size() << " const offsets, "
+                   << all_derived.size() << " derived inttoptr, "
+                   << "dynamic=" << has_dynamic_uses << ")\n";
+      for (auto off : offsets)
+        llvm::errs() << "[RSF]     offset: " << off << "\n";
+    }
 
-    // Dynamic phi-based stack pointers are common in loops. Replacing the
-    // phi globally (RAUW with ptrtoint(alloca)) is unsound because that phi
-    // may also feed non-address arithmetic/control values. Conservatively
-    // recover only constant-offset inttoptr users and leave dynamic uses
-    // untouched.
-    (void)has_dynamic_uses;
+    bool is_phi_base = llvm::isa<llvm::PHINode>(base);
     (void)is_phi_base;
+
+    // When the same base has both constant-offset and dynamic-offset inttoptr
+    // users (e.g. RC4 S-box: constant init at [rsp+0xD0] + dynamic loop at
+    // [rsp+rcx+0xE0]), converting only the constant-offset accesses to alloca
+    // GEPs while leaving dynamic accesses as inttoptr breaks the store-load
+    // chain.  Stores go to the alloca, loads come from inttoptr → InstCombine
+    // sees the alloca stores as dead and cascades into eliminating most of the
+    // function body.  Skip alloca creation entirely when dynamic uses exist.
+    if (has_dynamic_uses) {
+      if (debugStackFrame())
+        llvm::errs() << "[RSF]   SKIPPED (dynamic uses)\n";
+      continue;
+    }
+
     auto regions = clusterOffsets(offsets, 16);
+
+    if (debugStackFrame()) {
+      for (auto &r : regions)
+        llvm::errs() << "[RSF]   region: [" << r.min_offset << ", "
+                     << r.max_offset << "]\n";
+    }
 
     for (auto &region : regions) {
       int64_t min_off = region.min_offset;
