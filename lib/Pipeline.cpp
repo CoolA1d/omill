@@ -23,6 +23,7 @@
 #include <llvm/Transforms/Scalar/LoopUnrollPass.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 
@@ -92,6 +93,34 @@
 namespace omill {
 
 namespace {
+
+/// Lightweight pass that prints a phase label + elapsed time + function count.
+/// Gated by OMILL_PHASE_TIMING env var to avoid noise in normal operation.
+struct PhaseMarkerPass : llvm::PassInfoMixin<PhaseMarkerPass> {
+  std::string label_;
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point &origin() {
+    static auto t0 = Clock::now();
+    return t0;
+  }
+  explicit PhaseMarkerPass(llvm::StringRef label) : label_(label) {}
+  llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  Clock::now() - origin())
+                  .count();
+    llvm::errs() << "[omill] " << label_ << "  +" << ms << "ms  ("
+                 << M.size() << " functions)\n";
+    return llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
+/// Add a phase marker only if OMILL_PHASE_TIMING is set.
+void addPhaseMarker(llvm::ModulePassManager &MPM, llvm::StringRef label) {
+  static bool enabled = (std::getenv("OMILL_PHASE_TIMING") != nullptr);
+  if (enabled)
+    MPM.addPass(PhaseMarkerPass(label));
+}
 
 bool envDisabled(const char *name) {
   const char *v = std::getenv(name);
@@ -450,6 +479,7 @@ struct FoldCallsToConstantReturnPass
 }  // namespace
 
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
+  addPhaseMarker(MPM, "ABI: start");
   // Stack frame recovery runs per-function.
   {
     llvm::FunctionPassManager FPM;
@@ -473,6 +503,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(EliminateStateStructPass());
   }
 
+  addPhaseMarker(MPM, "ABI: inline lifted → native");
   // Inline the lifted functions into their native wrappers.
   // IMPORTANT: defer ALL per-function optimization until after
   // interprocedural inlining.  SEH handlers and CFF resolvers read
@@ -514,6 +545,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     FPM.addPass(ExpandI128DivRemPass());
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
+  addPhaseMarker(MPM, "ABI: final optimization");
   // Full optimization after inlining native wrappers.
   // SROA already ran above; start with InstCombine on the decomposed SSA.
   if (!envDisabled("OMILL_SKIP_ABI_FINAL_OPT")) {
@@ -562,6 +594,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "ABI: inline VM handlers");
   // Interprocedural inlining: inline VM handler _native functions into their
   // callers.  This enables store-to-load forwarding across the call boundary
   // (the caller stores constants to its native_stack, the VM handler reads
@@ -883,6 +916,10 @@ struct InternalizeRemillSemanticsPass
 }  // namespace
 
 void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
+  // Reset the phase timer origin on each pipeline build.
+  PhaseMarkerPass::origin() = PhaseMarkerPass::Clock::now();
+  addPhaseMarker(MPM, "Phase 0: start");
+
   // Phase 0: Strip remill intrinsic bodies to prevent AlwaysInlinerPass from
   // inlining them via call-site alwaysinline attributes.  Their bodies contain
   // switch/unreachable patterns that poison the entire function's control flow.
@@ -915,6 +952,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(InlineJumpTargetsPass());
   }
 
+  addPhaseMarker(MPM, "Phase 1: intrinsic lowering");
   // Phase 1: Intrinsic Lowering
   if (opts.lower_intrinsics) {
     llvm::FunctionPassManager FPM;
@@ -922,6 +960,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "Phase 2: state optimization");
   // Phase 2: State Optimization
   if (opts.optimize_state) {
     if (opts.deobfuscate && !envDisabled("OMILL_SKIP_STATE_MODULE_INLINER")) {
@@ -962,6 +1001,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
         llvm::RequireAnalysisPass<BinaryMemoryAnalysis, llvm::Module>());
   }
 
+  addPhaseMarker(MPM, "Phase 3: control flow");
   // Phase 3a: Resolve forced exceptions (UD2/INT3 → handler call).
   // Must run before the remaining control flow passes so the handler's body
   // can be inlined and then processed by LowerFunctionCall/LowerJump.
@@ -996,6 +1036,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "Phase 3.5: fold PC + IAT");
   // Phase 3.5: Fold program_counter to a constant and resolve IAT-indirect
   // dispatch_calls before ABI recovery eliminates program_counter.
   if (!envDisabled("OMILL_SKIP_PHASE35")) {
@@ -1019,6 +1060,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "Phase 3.56: VM devirtualization");
   // Phase 3.56: VM Devirtualization.
   // Resolve handler dispatch targets via binary graph lookup and eliminate
   // hash integrity checks.  Must run after Phase 3 has lowered __remill_jump
@@ -1045,11 +1087,13 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
 
+    addPhaseMarker(MPM, "Phase 3.56: VM handler inlining");
     // Inline small handler calls.
     MPM.addPass(VMHandlerInlinerPass(/*max_handler_instrs=*/500,
                                      /*min_callsites=*/1));
     MPM.addPass(llvm::AlwaysInlinerPass());
 
+    addPhaseMarker(MPM, "Phase 3.56: post-handler cleanup");
     // Clean up after handler inlining.
     {
       llvm::FunctionPassManager FPM;
@@ -1066,6 +1110,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::GlobalDCEPass());
   }
 
+  addPhaseMarker(MPM, "Phase 3.6: iterative target resolution");
   // Phase 3.6: Iterative indirect target resolution.
   if (opts.use_block_lifting) {
     // Block-lifting mode: optimize block-functions, resolve constant
@@ -1086,6 +1131,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   MPM.addPass(InternalizeRemillSemanticsPass());
   MPM.addPass(llvm::GlobalDCEPass());
 
+  addPhaseMarker(MPM, "Phase 3.7: IPCP");
   // Phase 3.7: Inter-procedural constant propagation.
   // After InterProceduralConstProp propagates R9 (DISPATCHER_CONTEXT* from
   // SEH resolution) to handler/resolver functions, ConstantMemoryFolding
@@ -1107,6 +1153,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "Phase 4: ABI recovery");
   // Phase 4: ABI Recovery
   if (opts.recover_abi) {
     buildABIRecoveryPipeline(MPM);
@@ -1117,6 +1164,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     }
   }
 
+  addPhaseMarker(MPM, "Phase 5: deobfuscation");
   // Phase 5: Deobfuscation (after ABI recovery for max constant visibility)
   if (opts.deobfuscate) {
     // Ensure BinaryMemoryAnalysis is cached before function passes need it.
@@ -1155,6 +1203,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  addPhaseMarker(MPM, "Final: cleanup");
   // Global cleanup
   MPM.addPass(llvm::GlobalDCEPass());
 }

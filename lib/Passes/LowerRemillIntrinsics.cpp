@@ -334,7 +334,7 @@ void lowerCompareExchange(llvm::CallInst *CI, unsigned bit_width) {
     desired = Builder.CreateLoad(int_ty, desired);
 
   auto *cmpxchg = Builder.CreateAtomicCmpXchg(
-      ptr, expected, desired, llvm::MaybeAlign(),
+      ptr, expected, desired, llvm::Align(bit_width / 8),
       llvm::AtomicOrdering::SequentiallyConsistent,
       llvm::AtomicOrdering::SequentiallyConsistent);
 
@@ -436,6 +436,18 @@ enum SyncHyperCallID : uint32_t {
   kX86ReadModelSpecificRegister = 263,
   kX86WriteModelSpecificRegister = 264,
   kX86WriteBackInvalidate = 265,
+  kX86SetSegmentES = 266,
+  kX86SetSegmentSS = 267,
+  kX86SetSegmentDS = 268,
+  kX86SetSegmentFS = 269,
+  kX86SetSegmentGS = 270,
+  kX86SetDebugReg = 271,
+  kAMD64SetDebugReg = 272,
+  kX86SetControlReg0 = 273,
+  kX86SetControlReg1 = 274,
+  kX86SetControlReg2 = 275,
+  kX86SetControlReg3 = 276,
+  kX86SetControlReg4 = 277,
   kAMD64SetControlReg0 = 278,
   kAMD64SetControlReg1 = 279,
   kAMD64SetControlReg2 = 280,
@@ -713,6 +725,24 @@ void lowerSyncHyperCall(llvm::CallInst *CI) {
   switch (ci->getZExtValue()) {
     case kAssertPrivileged:
     case kAMD64EmulateInstruction:
+    // Segment register writes: value already written to State by semantics.
+    // In x86-64 long mode, ES/DS/SS selectors are ignored.  FS/GS selector
+    // loads are not meaningful without a matching MSR write.  Emit NOP.
+    case kX86SetSegmentES:
+    case kX86SetSegmentSS:
+    case kX86SetSegmentDS:
+    case kX86SetSegmentFS:
+    case kX86SetSegmentGS:
+    // Debug register writes: value already written to State by semantics.
+    // DR0-DR7 are CPU hardware debug state; emit NOP for recompilation.
+    case kX86SetDebugReg:
+    case kAMD64SetDebugReg:
+    // Control register writes (x86 variants): same treatment as AMD64 CRs.
+    case kX86SetControlReg0:
+    case kX86SetControlReg1:
+    case kX86SetControlReg2:
+    case kX86SetControlReg3:
+    case kX86SetControlReg4:
       emitNopHyperCall(CI);
       break;
     case kX86CPUID:
@@ -901,10 +931,10 @@ void lowerIOPort(llvm::CallInst *CI, IntrinsicKind kind) {
   auto *port = Builder.CreateTrunc(CI->getArgOperand(1), i16_ty);
 
   if (is_read) {
-    // in al/ax/eax, dx
-    const char *asm_str = (bit_width == 8)  ? "in al, dx" :
-                          (bit_width == 16) ? "in ax, dx" :
-                                              "in eax, dx";
+    // AT&T syntax: inb/inw/inl $port, $result
+    const char *asm_str = (bit_width == 8)  ? "inb $1, $0" :
+                          (bit_width == 16) ? "inw $1, $0" :
+                                              "inl $1, $0";
     auto *asm_ty = llvm::FunctionType::get(int_ty, {i16_ty}, false);
     auto *ia = llvm::InlineAsm::get(asm_ty, asm_str,
                                     "={ax},{dx},~{dirflag},~{fpsr},~{flags}",
@@ -912,10 +942,10 @@ void lowerIOPort(llvm::CallInst *CI, IntrinsicKind kind) {
     auto *result = Builder.CreateCall(ia, {port});
     CI->replaceAllUsesWith(result);
   } else {
-    // out dx, al/ax/eax
-    const char *asm_str = (bit_width == 8)  ? "out dx, al" :
-                          (bit_width == 16) ? "out dx, ax" :
-                                              "out dx, eax";
+    // AT&T syntax: outb/outw/outl $value, $port
+    const char *asm_str = (bit_width == 8)  ? "outb $1, $0" :
+                          (bit_width == 16) ? "outw $1, $0" :
+                                              "outl $1, $0";
     auto *val = CI->getArgOperand(2);
     auto *void_ty = llvm::Type::getVoidTy(Ctx);
     auto *asm_ty = llvm::FunctionType::get(void_ty, {i16_ty, int_ty}, false);
