@@ -1422,6 +1422,10 @@ int main(int argc, char **argv) {
   if (ResolveTargets && !NoABI) {
     for (unsigned round = 0; round < 3; ++round) {
       // Collect constant inttoptr call targets.
+      // Match both ConstantExpr::IntToPtr and IntToPtrInst with constant
+      // operands — LLVM 21 no longer folds inttoptr(const) instructions
+      // to ConstantExpr form, so B3 dynamic rewrites from
+      // RewriteLiftedCallsToNative produce IntToPtrInst after GVN folds.
       llvm::DenseSet<uint64_t> late_targets;
       for (auto &F : *module) {
         for (auto &BB : F) {
@@ -1429,11 +1433,18 @@ int main(int argc, char **argv) {
             auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
             if (!call || call->getCalledFunction())
               continue;
-            auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(
-                call->getCalledOperand());
-            if (!ce || ce->getOpcode() != llvm::Instruction::IntToPtr)
-              continue;
-            auto *ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+            auto *callee_op = call->getCalledOperand();
+            llvm::ConstantInt *ci = nullptr;
+            // Case 1: ConstantExpr inttoptr.
+            if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_op)) {
+              if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+                ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+            }
+            // Case 2: IntToPtrInst with constant operand.
+            if (!ci) {
+              if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_op))
+                ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
+            }
             if (!ci)
               continue;
             uint64_t target = ci->getZExtValue();
@@ -1612,6 +1623,7 @@ int main(int argc, char **argv) {
       }
 
       // Patch call sites: replace inttoptr(i64 <const>) → @sub_<hex>_native
+      // Handles both ConstantExpr and IntToPtrInst forms.
       for (uint64_t pc : late_targets) {
         std::string native_name =
             "sub_" + llvm::Twine::utohexstr(pc).str() + "_native";
@@ -1620,11 +1632,23 @@ int main(int argc, char **argv) {
           continue;
         auto *pc_ci = llvm::ConstantInt::get(
             llvm::Type::getInt64Ty(ctx), pc);
+
+        // Case 1: ConstantExpr inttoptr — RAUW replaces all uses globally.
         auto *itp = llvm::ConstantExpr::getIntToPtr(
             pc_ci, llvm::PointerType::getUnqual(ctx));
-        // Replace all uses of inttoptr(pc) with the function pointer.
         if (itp->getNumUses() > 0)
           itp->replaceAllUsesWith(target_fn);
+
+        // Case 2: IntToPtrInst instructions with this constant operand.
+        // Each instruction is a separate Value, so scan and replace each.
+        for (auto *user : llvm::make_early_inc_range(pc_ci->users())) {
+          auto *inst = llvm::dyn_cast<llvm::IntToPtrInst>(user);
+          if (!inst)
+            continue;
+          inst->replaceAllUsesWith(target_fn);
+          if (inst->use_empty())
+            inst->eraseFromParent();
+        }
       }
 
       errs() << "Late discovery round " << (round + 1) << " complete\n";
