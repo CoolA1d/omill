@@ -184,6 +184,38 @@ bool applyRedirects(const DispatcherInfo &info,
     }
   }
 
+  // Phase 2.5: Update existing (non-proxy) PHI nodes in target blocks.
+  // When a redirect adds r.src as a new predecessor of r.true_target,
+  // every PHI in r.true_target needs an incoming value from r.src.
+  // Proxy PHIs (created in Phase 2) already have these entries.
+  // Existing PHIs that receive values from info.block (the dispatcher)
+  // need entries from each redirected source.
+  for (auto &[target, sources] : new_edges) {
+    for (auto &inst : *target) {
+      auto *phi = llvm::dyn_cast<llvm::PHINode>(&inst);
+      if (!phi)
+        break;
+      if (phi->getName().ends_with(".unflat"))
+        continue;  // Proxy PHIs already have entries from new sources.
+
+      int disp_idx = phi->getBasicBlockIndex(info.block);
+      if (disp_idx < 0)
+        continue;
+      llvm::Value *val_from_disp = phi->getIncomingValue(disp_idx);
+
+      for (auto &e : sources) {
+        llvm::Value *new_val = val_from_disp;
+        // If the value is a dispatcher PHI, use the source's contribution
+        // to that PHI (which dominates the source block).
+        if (auto *dp = llvm::dyn_cast<llvm::PHINode>(val_from_disp)) {
+          if (dp->getParent() == info.block)
+            new_val = dp->getIncomingValueForBlock(e.from);
+        }
+        phi->addIncoming(new_val, e.from);
+      }
+    }
+  }
+
   // Phase 3: In each target block, replace uses of dispatcher PHIs with
   // their proxy PHIs.  This handles values that flow through the dispatcher
   // to the target block.

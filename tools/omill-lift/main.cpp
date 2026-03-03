@@ -121,6 +121,11 @@ static cl::opt<bool> OmillTimePasses(
     cl::desc("Time each omill pass, printing elapsed time on exit"),
     cl::init(false));
 
+static cl::opt<bool> VerifyEach(
+    "verify-each",
+    cl::desc("Run module verifier after every pass (slow, for debugging)"),
+    cl::init(false));
+
 static cl::opt<std::string> ScanSection(
     "scan-section",
     cl::desc("Scan a PE section and output function classification as JSON"));
@@ -935,17 +940,22 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Set up pass timing instrumentation.
+  // Set up pass timing and verification instrumentation.
   PassInstrumentationCallbacks PIC;
   TimePassesHandler TimingHandler(OmillTimePasses);
   TimingHandler.registerCallbacks(PIC);
 
   // Set up pass infrastructure
-  PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
   ModuleAnalysisManager MAM;
+
+  StandardInstrumentations SI(ctx, /*DebugLogging=*/false,
+                              /*VerifyEach=*/VerifyEach);
+  SI.registerCallbacks(PIC, &MAM);
+
+  PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
 
   // Register custom module analyses first and keep backing storage stable.
   omill::BinaryMemoryMap raw_memory_map;
