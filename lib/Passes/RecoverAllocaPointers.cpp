@@ -571,8 +571,13 @@ trySpeculativeResolveToConstant(Value *V, Function &F,
     return std::nullopt;
 
   // Count distinct values and their frequencies.
+  // Skip DenseMap sentinel values to avoid UB.
   DenseMap<uint64_t, unsigned> Freq;
-  for (auto R : Results) Freq[R]++;
+  for (auto R : Results) {
+    if (R >= 0xFFFF'FFFF'FFFF'FFFEULL)
+      continue;
+    Freq[R]++;
+  }
 
   if (debugRecover()) {
     llvm::errs() << "  constant-eval: " << Freq.size()

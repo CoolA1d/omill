@@ -1004,6 +1004,14 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // Resolve opaque dispatch targets using the handler graph.
     MPM.addPass(VMDispatchResolutionPass());
 
+    // Lower resolved dispatch targets to direct calls.
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(
+          LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+
     // Eliminate hash integrity checks in handler functions.
     {
       llvm::FunctionPassManager FPM;
@@ -1014,7 +1022,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
 
-    // Resolve newly-constant dispatch targets and inline small handlers.
+    // Inline small handler calls.
     MPM.addPass(VMHandlerInlinerPass(/*max_handler_instrs=*/500,
                                      /*min_callsites=*/1));
     MPM.addPass(llvm::AlwaysInlinerPass());

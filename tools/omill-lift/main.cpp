@@ -782,6 +782,97 @@ int main(int argc, char **argv) {
     }
   }
 
+  // VM target discovery loop: after the pipeline resolves dispatch targets,
+  // some are newly discovered (image_base + RVA where RVA wasn't in the
+  // original binary scan).  Lift these new targets and re-run the pipeline.
+  if (vm_mode) {
+    for (unsigned vm_round = 0; vm_round < 4; ++vm_round) {
+      // Extract discovered targets from named metadata.
+      llvm::DenseSet<uint64_t> new_targets;
+      if (auto *named_md =
+              module->getNamedMetadata("omill.vm_discovered_targets")) {
+        for (unsigned i = 0; i < named_md->getNumOperands(); ++i) {
+          auto *tuple = named_md->getOperand(i);
+          if (tuple->getNumOperands() == 0)
+            continue;
+          if (auto *cmd = llvm::dyn_cast<llvm::ConstantAsMetadata>(
+                  tuple->getOperand(0))) {
+            if (auto *ci =
+                    llvm::dyn_cast<llvm::ConstantInt>(cmd->getValue())) {
+              uint64_t va = ci->getZExtValue();
+              std::string name =
+                  "sub_" + llvm::Twine::utohexstr(va).str();
+              auto *existing = module->getFunction(name);
+              if (!existing || existing->isDeclaration())
+                new_targets.insert(va);
+            }
+          }
+        }
+        // Remove so next round starts fresh.
+        module->eraseNamedMetadata(named_md);
+      }
+
+      if (new_targets.empty())
+        break;
+
+      errs() << "VM discovery round " << (vm_round + 1) << ": "
+             << new_targets.size() << " new target(s)\n";
+
+      // Lift new targets into the same module (we still have the lifter).
+      unsigned lift_ok = 0, lift_fail = 0;
+      for (uint64_t va : new_targets) {
+        if (lifter.Lift(va)) {
+          ++lift_ok;
+          std::string name =
+              "sub_" + llvm::Twine::utohexstr(va).str();
+          if (auto *fn = module->getFunction(name))
+            fn->addFnAttr("omill.vm_handler");
+        } else {
+          ++lift_fail;
+        }
+      }
+
+      // Fix DeclareLiftedFunction naming collisions.
+      for (auto &F : llvm::make_early_inc_range(*module)) {
+        if (!F.isDeclaration())
+          continue;
+        auto fname = F.getName();
+        if (!fname.starts_with("sub_"))
+          continue;
+        for (int i = 1; i <= 20; ++i) {
+          std::string def_name = (fname + "." + Twine(i)).str();
+          if (auto *def = module->getFunction(def_name)) {
+            if (!def->isDeclaration()) {
+              F.replaceAllUsesWith(def);
+              F.eraseFromParent();
+              def->setName(fname);
+              break;
+            }
+          }
+        }
+      }
+
+      errs() << "  lifted " << lift_ok;
+      if (lift_fail > 0)
+        errs() << " (" << lift_fail << " failed)";
+      errs() << "\n";
+
+      if (lift_ok == 0)
+        break;
+
+      // Re-run the pipeline on the updated module.
+      // Need to invalidate module analyses since new functions were added.
+      MAM.invalidate(*module, llvm::PreservedAnalyses::none());
+      {
+        ModulePassManager MPM;
+        omill::buildPipeline(MPM, opts);
+        MPM.run(*module, MAM);
+      }
+
+      errs() << "  pipeline re-run complete\n";
+    }
+  }
+
   // ABI recovery
   if (!NoABI) {
     ModulePassManager MPM;

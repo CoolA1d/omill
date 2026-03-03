@@ -479,9 +479,11 @@ static bool promoteStateToSSA(llvm::Function &F, const llvm::DataLayout &DL) {
 
     bool is_exit = llvm::isa<llvm::ReturnInst>(term);
     if (!is_exit) {
-      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(BB.getTerminator()->getPrevNode())) {
-        if (CI->isTailCall() || CI->isMustTailCall())
-          is_exit = true;
+      if (auto *prev = term->getPrevNode()) {
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(prev)) {
+          if (CI->isTailCall() || CI->isMustTailCall())
+            is_exit = true;
+        }
       }
     }
     if (!is_exit) continue;

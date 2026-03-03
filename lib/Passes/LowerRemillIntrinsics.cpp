@@ -72,9 +72,22 @@ bool removeBarriers(llvm::Function &F, IntrinsicTable &table) {
         continue;
 
       if (CI->isInlineAsm()) {
-        if (auto *IA = llvm::dyn_cast<llvm::InlineAsm>(CI->getCalledOperand()))
-          if (IA->getAsmString().empty() && IA->hasSideEffects())
+        if (auto *IA =
+                llvm::dyn_cast<llvm::InlineAsm>(CI->getCalledOperand())) {
+          auto asm_str = IA->getAsmString();
+          if (asm_str.empty() && IA->hasSideEffects()) {
             to_remove.push_back(CI);
+          } else if (asm_str == "int1" || asm_str == "int $1") {
+            // Remill emits "int1" or "int $1" for x86 ICEBP (opcode 0xF1)
+            // which the integrated assembler doesn't recognize.  Replace
+            // with the raw byte encoding.
+            auto *fixed = llvm::InlineAsm::get(
+                IA->getFunctionType(), ".byte 0xf1",
+                IA->getConstraintString(), IA->hasSideEffects(),
+                IA->isAlignStack(), IA->getDialect());
+            CI->setCalledOperand(fixed);
+          }
+        }
         continue;
       }
 
