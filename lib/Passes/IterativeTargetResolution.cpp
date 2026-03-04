@@ -13,13 +13,20 @@
 #include <llvm/Transforms/Scalar/ADCE.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Linker/Linker.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/FixIrreducible.h>
 #include <llvm/Transforms/Utils/LCSSA.h>
 #include <llvm/Transforms/Utils/LoopSimplify.h>
 
+#include <future>
+#include <thread>
+
 #include "omill/Analysis/BinaryMemoryMap.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/BC/BlockLifterAnalysis.h"
 #include "omill/BC/TraceLiftAnalysis.h"
 #include "omill/Passes/ConstantMemoryFolding.h"
 #include "omill/Passes/EliminateDeadPaths.h"
@@ -39,24 +46,18 @@ namespace omill {
 
 namespace {
 
-/// Check if a function contains any unresolved dispatch calls.
-bool hasUnresolvedDispatches(llvm::Function &F) {
-  for (auto &BB : F)
-    for (auto &I : BB)
-      if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I))
-        if (auto *callee = call->getCalledFunction()) {
-          auto name = callee->getName();
-          if (name == "__omill_dispatch_call" ||
-              name == "__omill_dispatch_jump")
-            return true;
-        }
-  return false;
-}
-
-/// Count unresolved __omill_dispatch_call and __omill_dispatch_jump calls.
-unsigned countUnresolvedDispatches(llvm::Module &M) {
+/// Combined dispatch info: total unresolved dispatch count + affected functions.
+struct DispatchInfo {
   unsigned count = 0;
+  llvm::SmallVector<llvm::Function *, 16> affected;
+};
+
+/// Scan the module once to collect both the total unresolved dispatch count
+/// and the set of non-declaration functions containing dispatches.
+DispatchInfo collectDispatchInfo(llvm::Module &M) {
+  DispatchInfo info;
   for (auto &F : M) {
+    bool func_affected = false;
     for (auto &BB : F) {
       for (auto &I : BB) {
         auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
@@ -66,25 +67,33 @@ unsigned countUnresolvedDispatches(llvm::Module &M) {
         if (!callee)
           continue;
         auto name = callee->getName();
-        if (name == "__omill_dispatch_call" || name == "__omill_dispatch_jump")
-          ++count;
+        if (name == "__omill_dispatch_call" ||
+            name == "__omill_dispatch_jump") {
+          ++info.count;
+          func_affected = true;
+        }
       }
     }
+    if (func_affected && !F.isDeclaration())
+      info.affected.push_back(&F);
   }
-  return count;
+  return info;
 }
 
-/// Collect the set of functions containing unresolved dispatch calls.
-llvm::SmallVector<llvm::Function *, 16>
-collectAffectedFunctions(llvm::Module &M) {
-  llvm::SmallVector<llvm::Function *, 16> result;
-  for (auto &F : M) {
-    if (F.isDeclaration())
-      continue;
-    if (hasUnresolvedDispatches(F))
-      result.push_back(&F);
-  }
-  return result;
+/// Count unresolved dispatches only (lightweight, no affected list).
+unsigned countUnresolvedDispatches(llvm::Module &M) {
+  unsigned count = 0;
+  for (auto &F : M)
+    for (auto &BB : F)
+      for (auto &I : BB)
+        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I))
+          if (auto *callee = call->getCalledFunction()) {
+            auto name = callee->getName();
+            if (name == "__omill_dispatch_call" ||
+                name == "__omill_dispatch_jump")
+              ++count;
+          }
+  return count;
 }
 
 /// Run a FunctionPassManager on a specific set of functions.
@@ -136,8 +145,29 @@ llvm::DenseSet<uint64_t> collectNewTargetPCs(
   return new_pcs;
 }
 
-/// Resolve a forward-declaration callee to its actual definition.
-llvm::Function *resolveToDefinition(llvm::Function *decl, llvm::Module &M) {
+/// Map from virtual address to defined function, for O(1) resolution.
+using VAFuncMap = llvm::DenseMap<uint64_t, llvm::Function *>;
+
+/// Build a VA-to-Function map for all defined sub_* functions.
+VAFuncMap buildVAToFunctionMap(llvm::Module &M) {
+  VAFuncMap map;
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (!F.getName().starts_with("sub_"))
+      continue;
+    uint64_t va = extractEntryVA(F.getName());
+    if (va == 0)
+      continue;
+    map.try_emplace(va, &F);
+  }
+  return map;
+}
+
+/// Resolve a forward-declaration callee to its actual definition using the
+/// prebuilt VA map for O(1) lookup instead of O(N) linear scan.
+llvm::Function *resolveToDefinition(llvm::Function *decl,
+                                    const VAFuncMap &va_map) {
   if (!decl->isDeclaration())
     return decl;
 
@@ -149,15 +179,12 @@ llvm::Function *resolveToDefinition(llvm::Function *decl, llvm::Module &M) {
   if (va == 0)
     return nullptr;
 
-  for (auto &F : M) {
-    if (&F == decl || F.isDeclaration())
-      continue;
-    if (!F.getName().starts_with("sub_"))
-      continue;
-    if (extractEntryVA(F.getName()) == va)
-      return &F;
-  }
-  return nullptr;
+  auto it = va_map.find(va);
+  if (it == va_map.end())
+    return nullptr;
+  if (it->second == decl)
+    return nullptr;
+  return it->second;
 }
 
 /// Inline lifted-function calls within functions that contain unresolved
@@ -193,6 +220,9 @@ bool inlineCalleesForDispatchResolution(
   if (targets.empty())
     return false;
 
+  // Build VA-to-function map once for O(1) resolution.
+  auto va_map = buildVAToFunctionMap(M);
+
   bool inlined_any = false;
 
   for (auto *F : targets) {
@@ -218,7 +248,7 @@ bool inlineCalleesForDispatchResolution(
           if (!callee->getName().starts_with("sub_"))
             continue;
 
-          llvm::Function *def = resolveToDefinition(callee, *F->getParent());
+          llvm::Function *def = resolveToDefinition(callee, va_map);
           if (!def || def->isDeclaration())
             continue;
           if (def == F)
@@ -390,6 +420,54 @@ buildDispatchSemanticSet(llvm::Module &M) {
   return result;
 }
 
+/// Build a PreservedAnalyses that preserves immutable module analyses.
+/// BinaryMemoryAnalysis, TraceLiftAnalysis, and BlockLiftAnalysis never
+/// change during ITR, so we avoid re-running their invalidation callbacks.
+llvm::PreservedAnalyses immutablePreserved() {
+  auto PA = llvm::PreservedAnalyses::none();
+  PA.preserve<BinaryMemoryAnalysis>();
+  PA.preserve<TraceLiftAnalysis>();
+  PA.preserve<BlockLiftAnalysis>();
+  return PA;
+}
+
+/// Run Step B: Lower remill intrinsics exposed by semantic inlining.
+void runStepB(llvm::ArrayRef<llvm::Function *> Funcs,
+              llvm::ModuleAnalysisManager &MAM,
+              llvm::Module &M) {
+  llvm::FunctionPassManager FPM;
+  FPM.addPass(LowerRemillIntrinsicsPass(
+      LowerCategories::Phase1 | LowerCategories::Phase3));
+  FPM.addPass(llvm::InstCombinePass());
+  FPM.addPass(llvm::SimplifyCFGPass());
+  runFPMOnFunctions(FPM, Funcs, MAM, M);
+}
+
+/// Run Step B2: State optimization after intrinsic lowering.
+/// When lightweight=true, uses a reduced 5-pass pipeline sufficient for
+/// ABI recovery but skipping heavy passes (GVN, SROA, DCE) that dispatch
+/// resolution needs.  Phase 5 (deobfuscation) runs GVN/SROA later anyway.
+void runStepB2(llvm::ArrayRef<llvm::Function *> Funcs,
+               llvm::ModuleAnalysisManager &MAM,
+               llvm::Module &M,
+               bool lightweight = false) {
+  llvm::FunctionPassManager StateFPM;
+  StateFPM.addPass(CollapseRemillSHRSwitchPass());
+  StateFPM.addPass(llvm::SimplifyCFGPass());
+  StateFPM.addPass(llvm::InstCombinePass());
+  StateFPM.addPass(OptimizeStatePass(OptimizePhases::All));
+  if (!lightweight) {
+    StateFPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    StateFPM.addPass(llvm::InstCombinePass());
+    StateFPM.addPass(llvm::DCEPass());
+    StateFPM.addPass(llvm::SimplifyCFGPass());
+    StateFPM.addPass(llvm::GVNPass());
+    StateFPM.addPass(llvm::InstCombinePass());
+  }
+  StateFPM.addPass(llvm::SimplifyCFGPass());
+  runFPMOnFunctions(StateFPM, Funcs, MAM, M);
+}
+
 /// Inline all alwaysinline callees within a single function until fixpoint.
 void inlineAlwaysInlineCalleesInFunc(llvm::Function *F) {
   if (F->isDeclaration())
@@ -476,15 +554,301 @@ void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
   llvm::errs() << "ITR: Step A Phase 2 complete\n";
 }
 
+/// Result from a parallel deferred-processing worker.
+struct WorkerResult {
+  llvm::SmallVector<char, 0> bitcode;
+  std::string error;  // empty on success
+};
+
+/// Process a chunk of deferred functions in an isolated LLVMContext.
+/// Parses the full module bitcode, finds chunk functions by name, runs
+/// Step A (semantic inlining) + Step B + Step B2 lightweight, then serializes
+/// the processed chunk functions back to bitcode.
+WorkerResult processDeferredChunk(llvm::StringRef module_bitcode,
+                                  const std::vector<std::string> &func_names) {
+  WorkerResult result;
+
+  // 1. Fresh LLVMContext + parse module.
+  llvm::LLVMContext ctx;
+  auto buf = llvm::MemoryBuffer::getMemBuffer(module_bitcode, "", false);
+  auto mod_or_err = llvm::parseBitcodeFile(buf->getMemBufferRef(), ctx);
+  if (!mod_or_err) {
+    result.error = llvm::toString(mod_or_err.takeError());
+    return result;
+  }
+  auto mod = std::move(*mod_or_err);
+
+  // 2. Find chunk functions by name.
+  llvm::SmallVector<llvm::Function *, 64> chunk_funcs;
+  llvm::DenseSet<llvm::Function *> chunk_set;
+  for (const auto &name : func_names) {
+    if (auto *F = mod->getFunction(name)) {
+      if (!F->isDeclaration()) {
+        chunk_funcs.push_back(F);
+        chunk_set.insert(F);
+      }
+    }
+  }
+  if (chunk_funcs.empty()) {
+    result.error = "no chunk functions found";
+    return result;
+  }
+
+  // 3. Delete bodies of non-chunk sub_*/block_* functions to reduce noise.
+  //    Keep semantic functions intact for inlining.
+  for (auto &F : *mod) {
+    if (F.isDeclaration() || chunk_set.count(&F))
+      continue;
+    auto name = F.getName();
+    if (name.starts_with("sub_") || name.starts_with("block_"))
+      F.deleteBody();
+  }
+
+  // 4. Setup independent analysis managers.
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
+  llvm::PassBuilder PB;
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  // 5. Step A: Inline alwaysinline semantic callees.
+  inlineAlwaysInlineCallees(chunk_funcs);
+  for (auto *F : chunk_funcs)
+    FAM.invalidate(*F, llvm::PreservedAnalyses::none());
+
+  // 6. Step B: Lower remill intrinsics.
+  runStepB(chunk_funcs, MAM, *mod);
+
+  // 7. Step B2: Lightweight state optimization.
+  runStepB2(chunk_funcs, MAM, *mod, /*lightweight=*/true);
+
+  // 8. Strip alwaysinline from callees of chunk functions.
+  for (auto *F : chunk_funcs) {
+    if (F->isDeclaration())
+      continue;
+    for (auto &BB : *F)
+      for (auto &I : BB)
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+          if (auto *Callee = CI->getCalledFunction())
+            if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+              Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
+  }
+
+  // 9. Delete all non-chunk function bodies to minimize bitcode size.
+  for (auto &F : *mod) {
+    if (F.isDeclaration() || chunk_set.count(&F))
+      continue;
+    F.deleteBody();
+    F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+  }
+
+  // 10. Serialize to bitcode.
+  llvm::raw_svector_ostream OS(result.bitcode);
+  llvm::WriteBitcodeToFile(*mod, OS);
+  return result;
+}
+
+/// Process deferred functions using module-splitting parallelism.
+/// Falls back to sequential processing for small workloads or errors.
+void parallelDeferredProcessing(llvm::ArrayRef<llvm::Function *> deferred,
+                                llvm::Module &M,
+                                llvm::ModuleAnalysisManager &MAM) {
+  // Helper: unprotect semantic functions (strip optnone/noinline, add
+  // alwaysinline).  Idempotent.
+  auto unprotectSemantics = [&M]() {
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone))
+        continue;
+      auto name = F.getName();
+      if (name.starts_with("sub_") || name.starts_with("block_") ||
+          name.starts_with("__remill_") || name.starts_with("__omill_"))
+        continue;
+      F.removeFnAttr(llvm::Attribute::OptimizeNone);
+      F.removeFnAttr(llvm::Attribute::NoInline);
+      F.addFnAttr(llvm::Attribute::AlwaysInline);
+    }
+  };
+
+  // Helper: strip alwaysinline from callees of processed functions.
+  auto stripAlwaysInline = [](llvm::ArrayRef<llvm::Function *> funcs) {
+    for (auto *F : funcs) {
+      if (F->isDeclaration())
+        continue;
+      for (auto &BB : *F)
+        for (auto &I : BB)
+          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+            if (auto *Callee = CI->getCalledFunction())
+              if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+                Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
+    }
+  };
+
+  // Helper: run the full sequential processing path.
+  auto runSequential = [&](llvm::ArrayRef<llvm::Function *> funcs) {
+    unprotectSemantics();
+    llvm::errs() << "ITR: deferred Step A (sequential): inlining semantics...\n";
+    inlineAlwaysInlineCallees(funcs);
+    {
+      auto &FAM =
+          MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+              .getManager();
+      for (auto *F : funcs)
+        FAM.invalidate(*F, llvm::PreservedAnalyses::none());
+    }
+    llvm::errs() << "ITR: deferred Step B...\n";
+    runStepB(funcs, MAM, M);
+    llvm::errs() << "ITR: deferred Step B2 (lightweight)...\n";
+    runStepB2(funcs, MAM, M, /*lightweight=*/true);
+    stripAlwaysInline(funcs);
+  };
+
+  // Determine thread count.
+  unsigned hw = std::thread::hardware_concurrency();
+  unsigned num_threads = std::min({hw, 6u, (unsigned)deferred.size()});
+
+  // Fall back to sequential for small workloads or single core.
+  if (num_threads < 2 || deferred.size() < 20) {
+    runSequential(deferred);
+    return;
+  }
+
+  llvm::errs() << "ITR: parallel deferred processing with " << num_threads
+               << " threads for " << deferred.size() << " functions\n";
+
+  // 1. Unprotect semantic functions before serialization so workers see
+  //    alwaysinline attributes.
+  unprotectSemantics();
+
+  // 2. Serialize main module to bitcode.
+  llvm::SmallVector<char, 0> module_bitcode;
+  {
+    llvm::raw_svector_ostream OS(module_bitcode);
+    llvm::WriteBitcodeToFile(M, OS);
+  }
+  llvm::errs() << "ITR: serialized module (" << module_bitcode.size()
+               << " bytes)\n";
+
+  // 3. Partition deferred function names into N chunks (round-robin).
+  std::vector<std::vector<std::string>> chunks(num_threads);
+  for (size_t i = 0; i < deferred.size(); ++i)
+    chunks[i % num_threads].push_back(deferred[i]->getName().str());
+
+  // 4. Launch workers via std::async.
+  llvm::StringRef bitcode_ref(module_bitcode.data(), module_bitcode.size());
+  std::vector<std::future<WorkerResult>> futures;
+  for (unsigned i = 0; i < num_threads; ++i) {
+    auto chunk_names = std::move(chunks[i]);
+    futures.push_back(std::async(std::launch::async,
+        [bitcode_ref, names = std::move(chunk_names)]() {
+          return processDeferredChunk(bitcode_ref, names);
+        }));
+  }
+
+  // 5. Join all workers.
+  std::vector<WorkerResult> results;
+  bool any_error = false;
+  for (auto &f : futures) {
+    results.push_back(f.get());
+    if (!results.back().error.empty()) {
+      llvm::errs() << "ITR: worker error: " << results.back().error << "\n";
+      any_error = true;
+    }
+  }
+
+  // 6. If any worker failed, fall back to sequential.
+  //    Main module bodies are still intact at this point.
+  if (any_error) {
+    llvm::errs() << "ITR: parallel failed, falling back to sequential\n";
+    runSequential(deferred);
+    return;
+  }
+
+  // 7. Delete deferred function bodies from main module.
+  for (auto *F : deferred) {
+    if (!F->isDeclaration())
+      F->deleteBody();
+  }
+
+  // 8. Link each worker's processed output back into the main module.
+  for (size_t i = 0; i < results.size(); ++i) {
+    auto &wr = results[i];
+    auto link_buf = llvm::MemoryBuffer::getMemBuffer(
+        llvm::StringRef(wr.bitcode.data(), wr.bitcode.size()), "", false);
+    auto sub_or_err =
+        llvm::parseBitcodeFile(link_buf->getMemBufferRef(), M.getContext());
+    if (!sub_or_err) {
+      llvm::errs() << "ITR: failed to parse worker " << i
+                   << " output: " << llvm::toString(sub_or_err.takeError())
+                   << "\n";
+      continue;
+    }
+    auto sub_module = std::move(*sub_or_err);
+
+    // Delete conflicting definitions from sub-module — keep only chunk funcs.
+    for (auto &F : llvm::make_early_inc_range(*sub_module)) {
+      if (F.isDeclaration())
+        continue;
+      if (auto *existing = M.getFunction(F.getName())) {
+        if (!existing->isDeclaration()) {
+          F.deleteBody();
+          F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+        }
+      }
+    }
+    // Delete conflicting global variable definitions.
+    for (auto &GV : llvm::make_early_inc_range(sub_module->globals())) {
+      if (GV.isDeclaration())
+        continue;
+      if (auto *existing =
+              M.getGlobalVariable(GV.getName(), /*AllowInternal=*/true)) {
+        if (!existing->isDeclaration()) {
+          GV.setInitializer(nullptr);
+          GV.setLinkage(llvm::GlobalValue::ExternalLinkage);
+        }
+      }
+    }
+
+    if (llvm::Linker::linkModules(M, std::move(sub_module)))
+      llvm::errs() << "ITR: linking worker " << i << " output failed\n";
+  }
+
+  // 9. Invalidate analyses for re-linked deferred functions.
+  {
+    auto &FAM =
+        MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M).getManager();
+    for (auto *F : deferred)
+      if (!F->isDeclaration())
+        FAM.invalidate(*F, llvm::PreservedAnalyses::none());
+  }
+
+  // 10. Strip alwaysinline from semantic functions (cleanup).
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+    if (!F.hasFnAttribute(llvm::Attribute::AlwaysInline))
+      continue;
+    auto name = F.getName();
+    if (!name.starts_with("sub_") && !name.starts_with("block_") &&
+        !name.starts_with("__remill_") && !name.starts_with("__omill_"))
+      F.removeFnAttr(llvm::Attribute::AlwaysInline);
+  }
+
+  llvm::errs() << "ITR: parallel deferred processing complete\n";
+}
+
 }  // namespace
 
 llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     llvm::Module &M, llvm::ModuleAnalysisManager &MAM) {
   unsigned iteration = 0;
-  unsigned prev_count = countUnresolvedDispatches(M);
-
-  if (prev_count == 0)
-    return llvm::PreservedAnalyses::all();
+  unsigned prev_count = 0;
 
   bool ever_changed = false;
   bool tried_inlining = false;
@@ -503,12 +867,24 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
   auto *lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
 
+  // Cache the dispatch semantic set — stable across the ITR loop since
+  // semantic functions don't change structure during resolution.
+  auto dispatch_set = buildDispatchSemanticSet(M);
+
   do {
     lifted_new_funcs = false;  // Reset each iteration.
 
-    // Collect functions with unresolved dispatches — only these need
-    // the expensive optimization passes in Step 1.
-    auto affected = collectAffectedFunctions(M);
+    // Collect dispatch info: both the count and the affected functions
+    // in a single module scan.
+    auto info = collectDispatchInfo(M);
+    if (info.count == 0) {
+      if (!ever_changed)
+        return llvm::PreservedAnalyses::all();
+      break;
+    }
+    if (iteration == 0)
+      prev_count = info.count;
+    auto affected = std::move(info.affected);
 
     // Filter Step 1 to only functions not yet optimized in a prior iteration.
     llvm::SmallVector<llvm::Function *, 16> needs_opt;
@@ -591,31 +967,27 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
                      << " new functions\n";
 
         llvm::SmallVector<llvm::Function *, 4> dispatch_new, deferred_new;
-        {
-          auto dispatch_set = buildDispatchSemanticSet(M);
-          for (auto *F : new_funcs) {
-            if (F->isDeclaration()) {
-              continue;
-            }
-            bool has_potential = false;
-            for (auto &BB : *F) {
-              for (auto &I : BB) {
-                auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-                if (!CI)
-                  continue;
-                auto *Callee = CI->getCalledFunction();
-                if (Callee && dispatch_set.count(Callee)) {
-                  has_potential = true;
-                  goto classified;
-                }
+        for (auto *F : new_funcs) {
+          if (F->isDeclaration())
+            continue;
+          bool has_potential = false;
+          for (auto &BB : *F) {
+            for (auto &I : BB) {
+              auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!CI)
+                continue;
+              auto *Callee = CI->getCalledFunction();
+              if (Callee && dispatch_set.count(Callee)) {
+                has_potential = true;
+                goto classified;
               }
             }
-            classified:
-            if (has_potential)
-              dispatch_new.push_back(F);
-            else
-              deferred_new.push_back(F);
           }
+          classified:
+          if (has_potential)
+            dispatch_new.push_back(F);
+          else
+            deferred_new.push_back(F);
         }
         llvm::errs() << "ITR: " << dispatch_new.size()
                      << " with dispatch potential, " << deferred_new.size()
@@ -665,47 +1037,15 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           }
 
           // Step B: Lower remill intrinsics now exposed by inlining.
-          {
-            llvm::errs() << "ITR: Step B: lowering remill intrinsics...\n";
-            llvm::FunctionPassManager FPM;
-            FPM.addPass(LowerRemillIntrinsicsPass(
-                LowerCategories::Phase1 | LowerCategories::Phase3));
-            FPM.addPass(llvm::InstCombinePass());
-            FPM.addPass(llvm::SimplifyCFGPass());
-            for (auto *F : dispatch_new) {
-              if (F->isDeclaration()) continue;
-              llvm::FunctionAnalysisManager &FAM =
-                  MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-                      .getManager();
-              FPM.run(*F, FAM);
-            }
-          }
+          llvm::errs() << "ITR: Step B: lowering remill intrinsics...\n";
+          runStepB(dispatch_new, MAM, M);
 
           // Step B2: State optimization — eliminate dead flag/PC stores.
-          {
-            llvm::errs() << "ITR: Step B2: state optimization on "
-                         << dispatch_new.size() << " functions...\n";
-            llvm::FunctionPassManager StateFPM;
-            StateFPM.addPass(CollapseRemillSHRSwitchPass());
-            StateFPM.addPass(llvm::SimplifyCFGPass());
-            StateFPM.addPass(llvm::InstCombinePass());
-            StateFPM.addPass(OptimizeStatePass(OptimizePhases::All));
-            StateFPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-            StateFPM.addPass(llvm::InstCombinePass());
-            StateFPM.addPass(llvm::DCEPass());
-            StateFPM.addPass(llvm::SimplifyCFGPass());
-            StateFPM.addPass(llvm::GVNPass());
-            StateFPM.addPass(llvm::InstCombinePass());
-            StateFPM.addPass(llvm::SimplifyCFGPass());
-            for (auto *F : dispatch_new) {
-              if (F->isDeclaration()) continue;
-              llvm::FunctionAnalysisManager &FAM =
-                  MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-                      .getManager();
-              StateFPM.run(*F, FAM);
-            }
-            llvm::errs() << "ITR: Step B2 complete\n";
-          }
+          llvm::errs() << "ITR: Step B2: state optimization on "
+                       << dispatch_new.size() << " functions...\n";
+          runStepB2(dispatch_new, MAM, M);
+          llvm::errs() << "ITR: Step B2 complete\n";
+
           // Mark dispatch functions as already optimized.
           for (auto *F : dispatch_new)
             already_optimized.insert(F);
@@ -729,7 +1069,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
         tried_inlining = false;
         tried_reverse_inlining = false;
         // Refresh the LiftedFunctionMap after lifting new functions.
-        MAM.invalidate(M, llvm::PreservedAnalyses::none());
+        MAM.invalidate(M, immutablePreserved());
         lifted = MAM.getCachedResult<LiftedFunctionAnalysis>(M);
         // Update baseline: new functions may increase dispatch count.
         prev_count = countUnresolvedDispatches(M);
@@ -766,8 +1106,8 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           llvm::errs() << "ITR: inlined callees into " << inline_modified.size()
                        << " functions\n";
 
-          // Invalidate ALL cached analyses — inlining modified CFGs.
-          MAM.invalidate(M, llvm::PreservedAnalyses::none());
+          // Invalidate cached analyses — inlining modified CFGs.
+          MAM.invalidate(M, immutablePreserved());
 
           // After inlining VM handler bodies, the handler's context reads
           // become inttoptr(ptrtoint(alloca)+C) patterns.
@@ -827,7 +1167,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           llvm::errs() << "ITR: reverse-inlined into "
                        << reverse_modified.size() << " functions\n";
 
-          MAM.invalidate(M, llvm::PreservedAnalyses::none());
+          MAM.invalidate(M, immutablePreserved());
 
           // Mark __remill_undefined_* as memory(none) so GVN can
           // forward State stores past them.  These return undefined
@@ -926,83 +1266,7 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
     llvm::errs() << "ITR: processing " << all_deferred.size()
                  << " deferred functions...\n";
     ever_changed = true;
-
-    // Unprotect semantic functions (may already be done, but idempotent).
-    for (auto &F : M) {
-      if (F.isDeclaration()) continue;
-      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone)) continue;
-      auto name = F.getName();
-      if (name.starts_with("sub_") || name.starts_with("block_") ||
-          name.starts_with("__remill_") || name.starts_with("__omill_"))
-        continue;
-      F.removeFnAttr(llvm::Attribute::OptimizeNone);
-      F.removeFnAttr(llvm::Attribute::NoInline);
-      F.addFnAttr(llvm::Attribute::AlwaysInline);
-    }
-
-    // Step A: Inline semantics.
-    llvm::errs() << "ITR: deferred Step A: inlining semantics...\n";
-    inlineAlwaysInlineCallees(all_deferred);
-    {
-      auto &FAM =
-          MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-              .getManager();
-      for (auto *F : all_deferred)
-        FAM.invalidate(*F, llvm::PreservedAnalyses::none());
-    }
-
-    // Step B: Lower remill intrinsics.
-    {
-      llvm::errs() << "ITR: deferred Step B...\n";
-      llvm::FunctionPassManager FPM;
-      FPM.addPass(LowerRemillIntrinsicsPass(
-          LowerCategories::Phase1 | LowerCategories::Phase3));
-      FPM.addPass(llvm::InstCombinePass());
-      FPM.addPass(llvm::SimplifyCFGPass());
-      for (auto *F : all_deferred) {
-        if (F->isDeclaration()) continue;
-        llvm::FunctionAnalysisManager &FAM =
-            MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-                .getManager();
-        FPM.run(*F, FAM);
-      }
-    }
-
-    // Step B2: State optimization.
-    {
-      llvm::errs() << "ITR: deferred Step B2...\n";
-      llvm::FunctionPassManager StateFPM;
-      StateFPM.addPass(CollapseRemillSHRSwitchPass());
-      StateFPM.addPass(llvm::SimplifyCFGPass());
-      StateFPM.addPass(llvm::InstCombinePass());
-      StateFPM.addPass(OptimizeStatePass(OptimizePhases::All));
-      StateFPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
-      StateFPM.addPass(llvm::InstCombinePass());
-      StateFPM.addPass(llvm::DCEPass());
-      StateFPM.addPass(llvm::SimplifyCFGPass());
-      StateFPM.addPass(llvm::GVNPass());
-      StateFPM.addPass(llvm::InstCombinePass());
-      StateFPM.addPass(llvm::SimplifyCFGPass());
-      for (auto *F : all_deferred) {
-        if (F->isDeclaration()) continue;
-        llvm::FunctionAnalysisManager &FAM =
-            MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
-                .getManager();
-        StateFPM.run(*F, FAM);
-      }
-    }
-
-    // Strip alwaysinline from callees.
-    for (auto *F : all_deferred) {
-      if (F->isDeclaration()) continue;
-      for (auto &BB : *F)
-        for (auto &I : BB)
-          if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
-            if (auto *Callee = CI->getCalledFunction())
-              if (Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
-                Callee->removeFnAttr(llvm::Attribute::AlwaysInline);
-    }
-
+    parallelDeferredProcessing(all_deferred, M, MAM);
     llvm::errs() << "ITR: deferred processing complete\n";
   }
 
