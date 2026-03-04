@@ -481,7 +481,9 @@ mcConcreteEval(llvm::Value *V,
     }
     // Other arguments (State ptr, memory) stay unresolved → random below.
   } else if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
-    Result = CI->getZExtValue();
+    // Wide constants (i128+ from XMM ops) can't be represented in uint64_t.
+    if (CI->getBitWidth() <= 64)
+      Result = CI->getZExtValue();
   } else if (llvm::isa<llvm::UndefValue>(V) || llvm::isa<llvm::PoisonValue>(V)) {
     Result = uint64_t(0);
   } else if (auto *P2I = llvm::dyn_cast<llvm::PtrToIntInst>(V)) {

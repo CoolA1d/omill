@@ -466,24 +466,33 @@ void runStepB2(llvm::ArrayRef<llvm::Function *> Funcs,
 void inlineAlwaysInlineCalleesInFunc(llvm::Function *F) {
   if (F->isDeclaration())
     return;
-  bool progress = true;
-  while (progress) {
-    progress = false;
-    for (auto &BB : *F) {
-      for (auto &I : llvm::make_early_inc_range(BB)) {
-        auto *CI = llvm::dyn_cast<llvm::CallInst>(&I);
-        if (!CI)
-          continue;
-        auto *Callee = CI->getCalledFunction();
-        if (!Callee || Callee->isDeclaration())
-          continue;
-        if (!Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
-          continue;
-        llvm::InlineFunctionInfo IFI;
-        if (llvm::InlineFunction(*CI, IFI).isSuccess())
-          progress = true;
-      }
-    }
+
+  // Collect alwaysinline call sites into a worklist instead of rescanning
+  // the entire function after every inline.  After Phase 1 pre-expansion,
+  // inlined bodies rarely contain further alwaysinline calls, so this
+  // typically processes the initial set and stops.  Any new alwaysinline
+  // calls discovered via InlinedCallSites are appended to the worklist.
+  llvm::SmallVector<llvm::CallInst *, 64> Worklist;
+  for (auto &BB : *F)
+    for (auto &I : BB)
+      if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
+        if (auto *Callee = CI->getCalledFunction())
+          if (!Callee->isDeclaration() &&
+              Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+            Worklist.push_back(CI);
+
+  while (!Worklist.empty()) {
+    auto *CI = Worklist.pop_back_val();
+    llvm::InlineFunctionInfo IFI;
+    if (!llvm::InlineFunction(*CI, IFI).isSuccess())
+      continue;
+    // Check newly inlined call sites for further alwaysinline calls.
+    for (auto *NewCS : IFI.InlinedCallSites)
+      if (auto *NewCI = llvm::dyn_cast<llvm::CallInst>(NewCS))
+        if (auto *Callee = NewCI->getCalledFunction())
+          if (!Callee->isDeclaration() &&
+              Callee->hasFnAttribute(llvm::Attribute::AlwaysInline))
+            Worklist.push_back(NewCI);
   }
 }
 
@@ -537,15 +546,41 @@ void inlineAlwaysInlineCallees(llvm::ArrayRef<llvm::Function *> Funcs) {
 
   // Phase 2: Inline pre-expanded semantics into target functions.
   // Callees are fully flattened, so this typically needs only 1 round.
+  // Skip functions that have no alwaysinline calls to avoid scanning them.
+  size_t skipped = 0;
   for (size_t I = 0; I < Funcs.size(); ++I) {
-    if (Funcs[I]->isDeclaration())
+    auto *F = Funcs[I];
+    if (F->isDeclaration()) {
+      ++skipped;
       continue;
+    }
+
+    // Quick check: does this function have any alwaysinline calls?
+    bool has_inline_calls = false;
+    for (auto &BB : *F) {
+      for (auto &Inst : BB) {
+        if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&Inst))
+          if (auto *Callee = CI->getCalledFunction())
+            if (!Callee->isDeclaration() &&
+                Callee->hasFnAttribute(llvm::Attribute::AlwaysInline)) {
+              has_inline_calls = true;
+              break;
+            }
+      }
+      if (has_inline_calls) break;
+    }
+    if (!has_inline_calls) {
+      ++skipped;
+      continue;
+    }
+
     if (I % 50 == 0)
       llvm::errs() << "ITR: Step A Phase 2: " << I << "/" << Funcs.size()
                    << "\n";
-    inlineAlwaysInlineCalleesInFunc(Funcs[I]);
+    inlineAlwaysInlineCalleesInFunc(F);
   }
-  llvm::errs() << "ITR: Step A Phase 2 complete\n";
+  llvm::errs() << "ITR: Step A Phase 2 complete (" << skipped
+               << " skipped)\n";
 }
 
 /// Process deferred functions: unprotect semantics, inline, lower, optimize.
