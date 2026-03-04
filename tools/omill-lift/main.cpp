@@ -45,6 +45,56 @@
 
 using namespace llvm;
 
+/// Repair malformed PHI nodes in a module so it can be written as valid LL.
+/// Handles two cases:
+/// 1. Incoming values from blocks that are not predecessors (stale entries).
+/// 2. Missing duplicate entries for multi-edge predecessors (e.g. switch
+///    with two cases branching to the same block needs two PHI entries).
+static void repairMalformedPHIs(Module &M) {
+  for (auto &F : M) {
+    if (F.isDeclaration()) continue;
+    for (auto &BB : F) {
+      // Count how many edges each predecessor has to this block.
+      DenseMap<BasicBlock *, unsigned> pred_edge_count;
+      for (auto *P : predecessors(&BB))
+        ++pred_edge_count[P];
+
+      for (auto &I : make_early_inc_range(BB)) {
+        auto *phi = dyn_cast<PHINode>(&I);
+        if (!phi) break;
+
+        // Remove entries from non-predecessors.
+        for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
+          if (!pred_edge_count.count(phi->getIncomingBlock(i))) {
+            phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
+          }
+        }
+
+        // Count current entries per predecessor.
+        DenseMap<BasicBlock *, unsigned> phi_count;
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+          ++phi_count[phi->getIncomingBlock(i)];
+
+        // Add missing duplicate entries for multi-edge predecessors.
+        for (auto &[pred, needed] : pred_edge_count) {
+          unsigned have = phi_count.lookup(pred);
+          if (have == 0) continue;  // No entry at all — can't invent a value.
+          for (unsigned j = have; j < needed; ++j) {
+            // Find the existing value for this predecessor.
+            Value *val = phi->getIncomingValueForBlock(pred);
+            phi->addIncoming(val, pred);
+          }
+        }
+
+        if (phi->getNumIncomingValues() == 0) {
+          phi->replaceAllUsesWith(PoisonValue::get(phi->getType()));
+          phi->eraseFromParent();
+        }
+      }
+    }
+  }
+}
+
 static cl::opt<std::string> InputFilename(cl::Positional,
                                            cl::desc("<input PE file>"),
                                            cl::Required);
@@ -1477,6 +1527,7 @@ int main(int argc, char **argv) {
       errs() << "  pipeline re-run complete\n";
 
       // Checkpoint: save LL after each VM discovery round.
+      repairMalformedPHIs(*module);
       {
         std::string ckpt_name =
             "vm_round_" + std::to_string(vm_round + 1) + ".ll";
@@ -1492,6 +1543,9 @@ int main(int argc, char **argv) {
 
   // ABI recovery
   if (!NoABI) {
+    // Repair broken PHIs before saving checkpoint (otherwise LLVM parser
+    // rejects the LL on reload).
+    repairMalformedPHIs(*module);
     // Checkpoint before ABI recovery (enables resuming after crash).
     {
       std::error_code ec;

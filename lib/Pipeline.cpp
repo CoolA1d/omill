@@ -519,7 +519,7 @@ struct FoldCallsToConstantReturnPass
 void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   addPhaseMarker(MPM, "ABI: start");
   // Stack frame recovery runs per-function.
-  {
+  if (!envDisabled("OMILL_SKIP_ABI_INITIAL_OPT")) {
     llvm::FunctionPassManager FPM;
     // Stack frame recovery already runs in state optimization.
     // Re-running it here can over-rewrite recovered stack-pointer arithmetic
@@ -555,16 +555,34 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
         bool changed = false;
         for (auto &F : M) {
           if (F.isDeclaration()) continue;
-          // Repair malformed PHI nodes.
+          // Repair malformed PHI nodes: remove stale entries and add
+          // missing duplicates for multi-edge predecessors (e.g. switch
+          // with two cases to the same block).
           for (auto &BB : F) {
-            llvm::SmallPtrSet<llvm::BasicBlock *, 8> preds(
-                llvm::pred_begin(&BB), llvm::pred_end(&BB));
+            llvm::DenseMap<llvm::BasicBlock *, unsigned> pred_edge_count;
+            for (auto *P : llvm::predecessors(&BB))
+              ++pred_edge_count[P];
+
             for (auto &I : llvm::make_early_inc_range(BB)) {
               auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
               if (!phi) break;
+              // Remove entries from non-predecessors.
               for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
-                if (!preds.count(phi->getIncomingBlock(i))) {
+                if (!pred_edge_count.count(phi->getIncomingBlock(i))) {
                   phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
+                  changed = true;
+                }
+              }
+              // Add missing duplicate entries for multi-edge preds.
+              llvm::DenseMap<llvm::BasicBlock *, unsigned> phi_count;
+              for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+                ++phi_count[phi->getIncomingBlock(i)];
+              for (auto &[pred, needed] : pred_edge_count) {
+                unsigned have = phi_count.lookup(pred);
+                if (have == 0) continue;
+                for (unsigned j = have; j < needed; ++j) {
+                  phi->addIncoming(
+                      phi->getIncomingValueForBlock(pred), pred);
                   changed = true;
                 }
               }

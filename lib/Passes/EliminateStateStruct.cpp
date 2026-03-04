@@ -20,6 +20,7 @@ void internalizeRecoveredFunctions(llvm::Module &M) {
     std::string native_name = F.getName().str() + "_native";
     if (M.getFunction(native_name)) {
       F.setLinkage(llvm::GlobalValue::InternalLinkage);
+      F.removeFnAttr(llvm::Attribute::NoInline);
       F.addFnAttr(llvm::Attribute::AlwaysInline);
     }
   }

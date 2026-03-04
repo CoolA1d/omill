@@ -64,6 +64,7 @@ bool collectOrTree(Value *V, SmallVectorImpl<ByteSlot> &Slots,
   const APInt *MaskAP;
   Value *Inner;
   if (match(Cur, m_And(m_Value(Inner), m_APInt(MaskAP)))) {
+    if (MaskAP->getActiveBits() > 64) return false;
     MaskVal = MaskAP->getZExtValue();
     Cur = Inner;
   }
@@ -71,6 +72,7 @@ bool collectOrTree(Value *V, SmallVectorImpl<ByteSlot> &Slots,
   // Match shl(X, C)
   const APInt *ShiftAP;
   if (match(Cur, m_Shl(m_Value(Inner), m_APInt(ShiftAP)))) {
+    if (ShiftAP->getActiveBits() > 64) return false;
     ShiftAmt = ShiftAP->getZExtValue();
     Cur = Inner;
   }

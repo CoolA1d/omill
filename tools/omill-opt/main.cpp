@@ -85,6 +85,11 @@ static cl::opt<bool> RecoverABI(
     cl::desc("Enable ABI recovery passes"),
     cl::init(false));
 
+static cl::opt<bool> OnlyRecoverABI(
+    "only-recover-abi",
+    cl::desc("Run ONLY ABI recovery (skip phases 0-3)"),
+    cl::init(false));
+
 static cl::opt<bool> ResolveTargets(
     "resolve-targets",
     cl::desc("Enable iterative indirect target resolution"),
@@ -126,16 +131,29 @@ int main(int argc, char **argv) {
 
   // Build the pipeline based on options.
   omill::PipelineOptions opts;
-  opts.lower_intrinsics = !NoLowerIntrinsics;
-  opts.optimize_state = !NoOptimizeState;
-  opts.lower_control_flow = !NoLowerControlFlow;
-  opts.run_cleanup_passes = !NoCleanup;
-  opts.deobfuscate = Deobfuscate;
-  opts.recover_abi = RecoverABI;
-  opts.resolve_indirect_targets = ResolveTargets;
-  opts.max_resolution_iterations = MaxIterations;
-  opts.refine_signatures = RefineSignatures;
-  opts.interprocedural_const_prop = IPCP;
+  if (OnlyRecoverABI) {
+    // Skip all phases except ABI recovery.
+    opts.lower_intrinsics = false;
+    opts.optimize_state = false;
+    opts.lower_control_flow = false;
+    opts.run_cleanup_passes = false;
+    opts.deobfuscate = false;
+    opts.recover_abi = true;
+    opts.resolve_indirect_targets = false;
+    opts.refine_signatures = RefineSignatures;
+    opts.interprocedural_const_prop = false;
+  } else {
+    opts.lower_intrinsics = !NoLowerIntrinsics;
+    opts.optimize_state = !NoOptimizeState;
+    opts.lower_control_flow = !NoLowerControlFlow;
+    opts.run_cleanup_passes = !NoCleanup;
+    opts.deobfuscate = Deobfuscate;
+    opts.recover_abi = RecoverABI;
+    opts.resolve_indirect_targets = ResolveTargets;
+    opts.max_resolution_iterations = MaxIterations;
+    opts.refine_signatures = RefineSignatures;
+    opts.interprocedural_const_prop = IPCP;
+  }
 
   // Set up pass timing instrumentation.
   PassInstrumentationCallbacks PIC;
