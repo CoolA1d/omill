@@ -871,7 +871,7 @@ struct UnprotectRemillSemanticsPass
     bool changed = false;
     for (auto &F : M) {
       if (F.isDeclaration()) continue;
-      if (!F.hasFnAttribute(llvm::Attribute::OptimizeNone)) continue;
+      if (F.hasFnAttribute(llvm::Attribute::AlwaysInline)) continue;
       auto name = F.getName();
       if (name.starts_with("sub_") || name.starts_with("block_") ||
           name.starts_with("__remill_") || name.starts_with("__omill_"))
