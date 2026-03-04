@@ -66,6 +66,27 @@ llvm::Value *normalizeJumpTargetPC(llvm::IRBuilder<> &Builder,
     return target_pc;
   }
 
+  // Constant-fold when the input is already a known constant.
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(target_pc)) {
+    uint64_t pc = CI->getZExtValue();
+    // Already canonical (within image)?
+    if (pc - image_base < image_size) {
+      return target_pc;
+    }
+    // Try low-32 as RVA.
+    uint64_t low32 = pc & 0xFFFFFFFFULL;
+    if (low32 < image_size) {
+      return llvm::ConstantInt::get(CI->getType(), image_base + low32);
+    }
+    // Try (pc - image_base) truncated to 32 bits as RVA.
+    uint64_t rva_low32 = (pc - image_base) & 0xFFFFFFFFULL;
+    if (rva_low32 < image_size) {
+      return llvm::ConstantInt::get(CI->getType(), image_base + rva_low32);
+    }
+    // No normalization matched; return as-is.
+    return target_pc;
+  }
+
   auto *i64_ty = Builder.getInt64Ty();
   auto *i32_ty = Builder.getInt32Ty();
   auto *base_c = llvm::ConstantInt::get(i64_ty, image_base);
@@ -425,7 +446,14 @@ llvm::PreservedAnalyses RewriteLiftedCallsToNativePass::run(
           // allocas, causing alias analysis to consider State/stack stores
           // dead and eliminating the function body.
 
-          buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
+          // For constant targets, store the normalized PC directly to RAX
+          // so downstream passes can see the canonical jump target.  For
+          // dynamic targets, store the indirect-call return value.
+          if (llvm::isa<llvm::ConstantInt>(target_pc)) {
+            buildStateStore(Builder, cand.state_ptr, kRAXOffset, target_pc);
+          } else {
+            buildStateStore(Builder, cand.state_ptr, kRAXOffset, result);
+          }
         } else {
           auto *ptr_ty = llvm::PointerType::get(Builder.getContext(), 0);
           auto *fn_ptr = Builder.CreateIntToPtr(target_pc, ptr_ty, "fn.ptr");
