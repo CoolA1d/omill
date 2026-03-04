@@ -977,6 +977,16 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // switch/unreachable patterns that poison the entire function's control flow.
   MPM.addPass(StripRemillIntrinsicBodiesPass());
 
+  // Helper: wrap FPM in a scoped adaptor when a scope predicate is set,
+  // otherwise use the standard module-to-function adaptor.
+  auto addScopedFPM = [&](llvm::FunctionPassManager FPM) {
+    if (opts.scope_predicate) {
+      MPM.addPass(createScopedFPM(std::move(FPM), opts.scope_predicate));
+    } else {
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+  };
+
   // Phase 0: Externalize semantic functions BEFORE AlwaysInliner.
   // The ~2000 semantic functions live in anonymous C++ namespaces and have
   // internal linkage by construction.  AlwaysInlinerPass inlines them into
@@ -1009,7 +1019,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   if (opts.lower_intrinsics) {
     llvm::FunctionPassManager FPM;
     buildIntrinsicLoweringPipeline(FPM);
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
   }
 
   addPhaseMarker(MPM, "Phase 2: state optimization");
@@ -1022,7 +1032,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 
     llvm::FunctionPassManager FPM;
     buildStateOptimizationPipeline(FPM, opts.deobfuscate);
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
   }
 
   // Synthesize flag patterns: after SROA/mem2reg promotes flag values to
@@ -1032,7 +1042,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     llvm::FunctionPassManager FPM;
     FPM.addPass(SynthesizeFlagsPass());
     FPM.addPass(llvm::InstCombinePass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
   }
 
   // In staged test flows, stop here to avoid running later phases on
@@ -1062,7 +1072,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     if (!envDisabled("OMILL_SKIP_RESOLVE_FORCED_EXCEPTIONS")) {
       FPM.addPass(ResolveForcedExceptionsPass());
     }
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
 
     // Inline exception handlers into their callers.  This is critical:
     // CFF handlers are trampolines that call resolvers.  Without inlining,
@@ -1085,7 +1095,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   if (opts.lower_control_flow) {
     llvm::FunctionPassManager FPM;
     buildControlFlowPipeline(FPM);
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
   }
 
   addPhaseMarker(MPM, "Phase 3.5: fold PC + IAT");
@@ -1098,7 +1108,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     FPM.addPass(llvm::InstCombinePass());
     FPM.addPass(ResolveIATCallsPass());
     FPM.addPass(LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
   }
 
   // Phase 3.55: Proactive jump table concretization.
@@ -1109,7 +1119,7 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   if (opts.resolve_indirect_targets || opts.use_block_lifting) {
     llvm::FunctionPassManager FPM;
     FPM.addPass(JumpTableConcretizerPass());
-    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    addScopedFPM(std::move(FPM));
   }
 
   addPhaseMarker(MPM, "Phase 3.56: VM devirtualization");

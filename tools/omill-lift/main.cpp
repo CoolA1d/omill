@@ -1400,8 +1400,10 @@ int main(int argc, char **argv) {
           ++lift_ok;
           std::string name =
               "sub_" + llvm::Twine::utohexstr(va).str();
-          if (auto *fn = module->getFunction(name))
+          if (auto *fn = module->getFunction(name)) {
             fn->addFnAttr("omill.vm_handler");
+            fn->addFnAttr("omill.vm_newly_lifted");
+          }
         } else {
           ++lift_fail;
         }
@@ -1411,6 +1413,10 @@ int main(int argc, char **argv) {
       for (uint64_t va : call_targets) {
         if (lifter.Lift(va)) {
           ++lift_ok;
+          std::string name =
+              "sub_" + llvm::Twine::utohexstr(va).str();
+          if (auto *fn = module->getFunction(name))
+            fn->addFnAttr("omill.vm_newly_lifted");
         } else {
           ++lift_fail;
         }
@@ -1454,9 +1460,18 @@ int main(int argc, char **argv) {
         vm_opts.deobfuscate = false;
         vm_opts.resolve_indirect_targets = false;
         vm_opts.interprocedural_const_prop = false;
+        vm_opts.scope_predicate = [](llvm::Function &F) {
+          return F.hasFnAttribute("omill.vm_newly_lifted");
+        };
         ModulePassManager MPM;
         omill::buildPipeline(MPM, vm_opts);
         MPM.run(*module, MAM);
+      }
+
+      // Clear the newly-lifted tags so next round starts fresh.
+      for (auto &F : *module) {
+        if (F.hasFnAttribute("omill.vm_newly_lifted"))
+          F.removeFnAttr("omill.vm_newly_lifted");
       }
 
       errs() << "  pipeline re-run complete\n";

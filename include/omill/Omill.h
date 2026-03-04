@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/IR/PassManager.h>
 
@@ -49,6 +51,12 @@ struct PipelineOptions {
   /// checks for EAC-style hash-threaded interpreter VMs.  Requires
   /// VMHandlerGraphAnalysis to be registered.
   bool vm_devirtualize = false;
+
+  /// When set, per-function pass adaptors in Phases 1–3.5 run only on
+  /// functions matching this predicate.  Module-wide passes are unaffected.
+  /// Used by the VM discovery loop to avoid re-processing already-optimized
+  /// functions.
+  std::function<bool(llvm::Function &)> scope_predicate;
 
   /// Use the blocks-as-functions lifting architecture instead of TraceLifter.
   /// When enabled, the pipeline inserts IterativeBlockDiscoveryPass and
