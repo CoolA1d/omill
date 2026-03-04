@@ -641,20 +641,26 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
         : llvm::PassInfoMixin<InlineVMHandlersAndCleanupPass> {
       llvm::PreservedAnalyses run(llvm::Module &M,
                                    llvm::ModuleAnalysisManager &MAM) {
-        // Mark VM handler _native functions for inlining and collect their
-        // callers so we only run expensive cleanup on affected functions.
+        // Mark VM handler functions for inlining and collect caller names
+        // so we can find them after inlining (Function* may be invalidated).
         bool has_vm_handlers = false;
-        llvm::DenseSet<llvm::Function *> callers;
+        llvm::SmallVector<std::string, 16> caller_names;
         for (auto &F : M) {
-          if (!F.hasFnAttribute("omill.vm_handler") ||
-              !F.getName().ends_with("_native"))
+          if (!F.hasFnAttribute("omill.vm_handler"))
             continue;
+          // Handle both cases: _native wrappers (if they exist) and
+          // original lifted functions (when RecoverFunctionSignatures
+          // skipped them).
+          if (!F.getName().ends_with("_native") &&
+              M.getFunction((F.getName() + "_native").str()))
+            continue;  // Has a _native wrapper — skip the original.
+          F.setLinkage(llvm::GlobalValue::InternalLinkage);
           F.removeFnAttr(llvm::Attribute::NoInline);
           F.addFnAttr(llvm::Attribute::AlwaysInline);
           has_vm_handlers = true;
           for (auto *U : F.users()) {
             if (auto *CB = llvm::dyn_cast<llvm::CallBase>(U))
-              callers.insert(CB->getFunction());
+              caller_names.push_back(CB->getFunction()->getName().str());
           }
         }
         if (!has_vm_handlers)
@@ -683,8 +689,10 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
           FPM.addPass(llvm::ADCEPass());
           FPM.addPass(llvm::InstCombinePass());
           FPM.addPass(llvm::SimplifyCFGPass());
-          for (auto *F : callers) {
-            if (F->isDeclaration())
+          llvm::DenseSet<llvm::Function *> seen;
+          for (const auto &name : caller_names) {
+            auto *F = M.getFunction(name);
+            if (!F || F->isDeclaration() || !seen.insert(F).second)
               continue;
             auto PA = FPM.run(*F, FAM);
             FAM.invalidate(*F, PA);

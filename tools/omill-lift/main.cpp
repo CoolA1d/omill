@@ -1311,8 +1311,8 @@ int main(int argc, char **argv) {
   // original binary scan).  Lift these new targets and re-run the pipeline.
   if (vm_mode) {
     for (unsigned vm_round = 0; vm_round < 4; ++vm_round) {
-      // Extract discovered targets from named metadata.
-      llvm::DenseSet<uint64_t> new_targets;
+      // Extract discovered dispatch targets from named metadata.
+      llvm::DenseSet<uint64_t> dispatch_targets;
       if (auto *named_md =
               module->getNamedMetadata("omill.vm_discovered_targets")) {
         for (unsigned i = 0; i < named_md->getNumOperands(); ++i) {
@@ -1328,7 +1328,7 @@ int main(int argc, char **argv) {
                   "sub_" + llvm::Twine::utohexstr(va).str();
               auto *existing = module->getFunction(name);
               if (!existing || existing->isDeclaration())
-                new_targets.insert(va);
+                dispatch_targets.insert(va);
             }
           }
         }
@@ -1336,21 +1336,81 @@ int main(int argc, char **argv) {
         module->eraseNamedMetadata(named_md);
       }
 
-      if (new_targets.empty())
+      // Scan for dispatch_call(state, ConstantInt(pc), mem) where pc
+      // points to unlifted code.  These are calls whose target was folded
+      // to a constant by GVN/InstCombine but wasn't in the module when
+      // LowerFunctionCall ran, so they went through the dispatch stub.
+      // RewriteLiftedCallsToNative (during ABI recovery) would turn them
+      // into inttoptr indirect calls; lifting them NOW lets that pass
+      // resolve them to direct calls instead.
+      llvm::DenseSet<uint64_t> call_targets;
+      auto *dispatch_fn = module->getFunction("__omill_dispatch_call");
+      auto *dispatch_jmp = module->getFunction("__omill_dispatch_jump");
+      auto scanDispatchUses = [&](llvm::Function *dispatcher) {
+        if (!dispatcher)
+          return;
+        for (auto *U : dispatcher->users()) {
+          auto *call = llvm::dyn_cast<llvm::CallInst>(U);
+          if (!call || call->arg_size() < 2)
+            continue;
+          auto *ci = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
+          if (!ci)
+            continue;
+          uint64_t target = ci->getZExtValue();
+          if (target == 0)
+            continue;
+          bool in_code = false;
+          if (RawBinary) {
+            in_code = (target >= BaseAddress &&
+                       target < BaseAddress + raw_code.size());
+          } else {
+            for (auto &sec : pe.code_sections) {
+              if (target >= sec.va && target < sec.va + sec.size) {
+                in_code = true;
+                break;
+              }
+            }
+          }
+          if (!in_code)
+            continue;
+          std::string name =
+              "sub_" + llvm::Twine::utohexstr(target).str();
+          auto *existing = module->getFunction(name);
+          if (!existing || existing->isDeclaration())
+            call_targets.insert(target);
+        }
+      };
+      scanDispatchUses(dispatch_fn);
+      scanDispatchUses(dispatch_jmp);
+      // Remove targets already covered by dispatch discovery.
+      for (uint64_t va : dispatch_targets)
+        call_targets.erase(va);
+
+      if (dispatch_targets.empty() && call_targets.empty())
         break;
 
       errs() << "VM discovery round " << (vm_round + 1) << ": "
-             << new_targets.size() << " new target(s)\n";
+             << dispatch_targets.size() << " dispatch + "
+             << call_targets.size() << " call target(s)\n";
 
-      // Lift new targets into the same module (we still have the lifter).
+      // Lift dispatch targets as VM handlers.
       unsigned lift_ok = 0, lift_fail = 0;
-      for (uint64_t va : new_targets) {
+      for (uint64_t va : dispatch_targets) {
         if (lifter.Lift(va)) {
           ++lift_ok;
           std::string name =
               "sub_" + llvm::Twine::utohexstr(va).str();
           if (auto *fn = module->getFunction(name))
             fn->addFnAttr("omill.vm_handler");
+        } else {
+          ++lift_fail;
+        }
+      }
+      // Lift call targets as regular functions (NOT vm_handler — they
+      // get _native wrappers via RecoverFunctionSignatures).
+      for (uint64_t va : call_targets) {
+        if (lifter.Lift(va)) {
+          ++lift_ok;
         } else {
           ++lift_fail;
         }
@@ -1384,12 +1444,18 @@ int main(int argc, char **argv) {
       if (lift_ok == 0)
         break;
 
-      // Re-run the pipeline on the updated module.
-      // Need to invalidate module analyses since new functions were added.
+      // Re-run the pipeline on the updated module.  Use a lightweight
+      // configuration that skips deobfuscation (Phase 5) and iterative
+      // target resolution (Phase 3.6) — the outer VM discovery loop
+      // handles the iteration, and deobf is deferred to post-ABI.
       MAM.invalidate(*module, llvm::PreservedAnalyses::none());
       {
+        omill::PipelineOptions vm_opts = opts;
+        vm_opts.deobfuscate = false;
+        vm_opts.resolve_indirect_targets = false;
+        vm_opts.interprocedural_const_prop = false;
         ModulePassManager MPM;
-        omill::buildPipeline(MPM, opts);
+        omill::buildPipeline(MPM, vm_opts);
         MPM.run(*module, MAM);
       }
 
@@ -1410,6 +1476,91 @@ int main(int argc, char **argv) {
         if (!F.isDeclaration() && verifyFunction(F, nullptr))
           errs() << "  broken function: " << F.getName() << "\n";
       return 1;
+    }
+
+    // Patch B3 call sites: after ABI recovery created _native wrappers,
+    // scan for inttoptr(i64 X to ptr) call targets where @sub_X_native
+    // exists, and rewrite them to direct calls.  This resolves constant
+    // targets that were discovered during VM discovery or optimization
+    // but couldn't be resolved at the time (the target wasn't lifted yet
+    // when RewriteLiftedCallsToNative ran).
+    {
+      unsigned patched = 0;
+      // Collect all constant-integer values used as inttoptr call targets.
+      llvm::DenseSet<uint64_t> targets_to_patch;
+      for (auto &F : *module) {
+        for (auto &BB : F) {
+          for (auto &I : BB) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+            if (!call || call->getCalledFunction())
+              continue;
+            auto *callee_op = call->getCalledOperand();
+            llvm::ConstantInt *ci = nullptr;
+            if (auto *ce =
+                    llvm::dyn_cast<llvm::ConstantExpr>(callee_op)) {
+              if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+                ci = llvm::dyn_cast<llvm::ConstantInt>(
+                    ce->getOperand(0));
+            }
+            if (!ci) {
+              if (auto *itp =
+                      llvm::dyn_cast<llvm::IntToPtrInst>(callee_op))
+                ci = llvm::dyn_cast<llvm::ConstantInt>(
+                    itp->getOperand(0));
+            }
+            if (ci && ci->getZExtValue() != 0)
+              targets_to_patch.insert(ci->getZExtValue());
+          }
+        }
+      }
+      for (uint64_t pc : targets_to_patch) {
+        std::string native_name =
+            "sub_" + llvm::Twine::utohexstr(pc).str() + "_native";
+        auto *target_fn = module->getFunction(native_name);
+        if (!target_fn)
+          continue;
+        auto *pc_ci =
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), pc);
+        // ConstantExpr inttoptr — RAUW replaces all uses globally.
+        auto *itp_ce = llvm::ConstantExpr::getIntToPtr(
+            pc_ci, llvm::PointerType::getUnqual(ctx));
+        if (itp_ce->getNumUses() > 0) {
+          patched += itp_ce->getNumUses();
+          itp_ce->replaceAllUsesWith(target_fn);
+        }
+        // IntToPtrInst with constant operand.
+        for (auto *user : llvm::make_early_inc_range(pc_ci->users())) {
+          auto *inst = llvm::dyn_cast<llvm::IntToPtrInst>(user);
+          if (!inst)
+            continue;
+          patched += inst->getNumUses();
+          inst->replaceAllUsesWith(target_fn);
+          if (inst->use_empty())
+            inst->eraseFromParent();
+        }
+      }
+      if (patched > 0)
+        errs() << "Patched " << patched
+               << " inttoptr call sites to direct calls\n";
+    }
+
+    // Post-ABI deobfuscation on _native functions.  When recover_abi is
+    // false (VM mode), Phase 5 ran on pre-ABI sub_* functions, so _native
+    // wrappers created by ABI recovery haven't been deobfuscated yet.
+    if (Deobfuscate) {
+      llvm::FunctionPassManager FPM;
+      omill::buildDeobfuscationPipeline(FPM);
+      for (auto &F : *module) {
+        if (F.isDeclaration() || !F.getName().ends_with("_native"))
+          continue;
+        auto &FAM =
+            MAM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(*module)
+                .getManager();
+        auto PA = FPM.run(F, FAM);
+        if (!PA.areAllPreserved())
+          FAM.invalidate(F, PA);
+      }
+      errs() << "Post-ABI deobfuscation complete\n";
     }
   }
 
