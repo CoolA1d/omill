@@ -779,9 +779,14 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
           // and IndirectCallResolver's Monte Carlo evaluator picks up
           // the folded dispatch targets in the next iteration.
           {
-            // Only run on functions with dispatches — those are the ones
-            // that had callees inlined into them.
-            auto post_inline = collectAffectedFunctions(M);
+            // Only run on functions actually modified by inlining, not
+            // all affected — unmodified functions are already optimized.
+            llvm::SmallPtrSet<llvm::Function *, 16> modified_set(
+                inline_modified.begin(), inline_modified.end());
+            llvm::SmallVector<llvm::Function *, 16> post_inline(
+                modified_set.begin(), modified_set.end());
+            llvm::errs() << "ITR: post-inline optimizing "
+                         << post_inline.size() << " modified functions\n";
             llvm::FunctionPassManager FPM;
             FPM.addPass(RecoverAllocaPointersPass());
             FPM.addPass(llvm::GVNPass());
@@ -853,13 +858,19 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
               F.addFnAttr("omill.vm_handler");
           }
 
+          // Deduplicate the modified set — only these callers need
+          // re-optimization, not all 2500+ affected functions.
+          llvm::SmallPtrSet<llvm::Function *, 16> rev_set(
+              reverse_modified.begin(), reverse_modified.end());
+          llvm::SmallVector<llvm::Function *, 16> post_reverse(
+              rev_set.begin(), rev_set.end());
+          llvm::errs() << "ITR: post-reverse optimizing "
+                       << post_reverse.size() << " modified functions\n";
+
           // Phase A: Collapse SHR switches from the inlined handler,
           // then promote State fields to allocas so stores are visible
           // to SROA/GVN without inttoptr aliasing barriers.
-          // Only run on functions with dispatches (callers that received
-          // the reverse-inlined handler bodies).
           {
-            auto post_reverse = collectAffectedFunctions(M);
             llvm::FunctionPassManager FPM;
             FPM.addPass(CollapseRemillSHRSwitchPass());
             FPM.addPass(llvm::SimplifyCFGPass());
@@ -872,7 +883,6 @@ llvm::PreservedAnalyses IterativeTargetResolutionPass::run(
 
           // Phase B: Standard cleanup with constant folding.
           {
-            auto post_reverse = collectAffectedFunctions(M);
             llvm::FunctionPassManager FPM;
             FPM.addPass(RecoverAllocaPointersPass());
             FPM.addPass(llvm::GVNPass());
