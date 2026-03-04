@@ -1475,11 +1475,32 @@ int main(int argc, char **argv) {
       }
 
       errs() << "  pipeline re-run complete\n";
+
+      // Checkpoint: save LL after each VM discovery round.
+      {
+        std::string ckpt_name =
+            "vm_round_" + std::to_string(vm_round + 1) + ".ll";
+        std::error_code ec;
+        raw_fd_ostream os(ckpt_name, ec, sys::fs::OF_Text);
+        if (!ec) {
+          module->print(os, nullptr);
+          errs() << "  saved checkpoint: " << ckpt_name << "\n";
+        }
+      }
     }
   }
 
   // ABI recovery
   if (!NoABI) {
+    // Checkpoint before ABI recovery (enables resuming after crash).
+    {
+      std::error_code ec;
+      raw_fd_ostream os("before_abi.ll", ec, sys::fs::OF_Text);
+      if (!ec) {
+        module->print(os, nullptr);
+        errs() << "Saved before_abi.ll\n";
+      }
+    }
     ModulePassManager MPM;
     omill::buildABIRecoveryPipeline(MPM);
     MPM.run(*module, MAM);

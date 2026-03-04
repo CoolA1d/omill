@@ -1,5 +1,7 @@
 #include "omill/Omill.h"
 
+#include <llvm/IR/CFG.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/ADT/DenseMap.h>
@@ -539,6 +541,43 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
   }
 
   addPhaseMarker(MPM, "ABI: inline lifted → native");
+  // Repair malformed PHI nodes before inlining.  Passes that replace
+  // terminators (LowerFunctionReturn, LowerJump, etc.) can leave PHI
+  // nodes with incoming values from blocks that are no longer
+  // predecessors.  CloneAndPruneFunctionInto (used by AlwaysInliner)
+  // crashes on these with SEH 0xC0000005 in removeIncomingValue.
+  {
+    struct RepairMalformedPHIsPass
+        : llvm::PassInfoMixin<RepairMalformedPHIsPass> {
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &FAM) {
+        bool changed = false;
+        for (auto &BB : F) {
+          llvm::SmallPtrSet<llvm::BasicBlock *, 8> preds(
+              llvm::pred_begin(&BB), llvm::pred_end(&BB));
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            auto *phi = llvm::dyn_cast<llvm::PHINode>(&I);
+            if (!phi) break;
+            for (unsigned i = phi->getNumIncomingValues(); i-- > 0;) {
+              if (!preds.count(phi->getIncomingBlock(i))) {
+                phi->removeIncomingValue(i, /*DeletePHIIfEmpty=*/false);
+                changed = true;
+              }
+            }
+            if (phi->getNumIncomingValues() == 0) {
+              phi->replaceAllUsesWith(llvm::PoisonValue::get(phi->getType()));
+              phi->eraseFromParent();
+            }
+          }
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(
+        RepairMalformedPHIsPass{}));
+  }
   // Inline the lifted functions into their native wrappers.
   // IMPORTANT: defer ALL per-function optimization until after
   // interprocedural inlining.  SEH handlers and CFF resolvers read
@@ -654,6 +693,12 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
           if (!F.getName().ends_with("_native") &&
               M.getFunction((F.getName() + "_native").str()))
             continue;  // Has a _native wrapper — skip the original.
+          // Only inline VM handlers that have callers.  Uncalled handlers
+          // (deferred functions whose addresses weren't resolved to direct
+          // calls) must be kept — they're still reachable via indirect
+          // dispatch at runtime.
+          if (F.use_empty())
+            continue;
           F.setLinkage(llvm::GlobalValue::InternalLinkage);
           F.removeFnAttr(llvm::Attribute::NoInline);
           F.addFnAttr(llvm::Attribute::AlwaysInline);

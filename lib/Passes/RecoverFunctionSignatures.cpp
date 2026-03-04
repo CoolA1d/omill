@@ -283,11 +283,12 @@ llvm::PreservedAnalyses RecoverFunctionSignaturesPass::run(
   llvm::SmallVector<llvm::Function *, 16> functions;
   for (auto &F : M) {
     if (!isLiftedFunction(F)) continue;
-    // Skip VM handler functions — they'll be inlined directly into their
-    // caller's _native wrapper by InlineVMHandlersAndCleanupPass.
-    // Creating individual _native wrappers for ~6000 handlers is extremely
-    // expensive (AlwaysInliner + SROA for each), only to inline them again.
-    if (F.hasFnAttribute("omill.vm_handler"))
+    // Skip VM handler functions that have callers — they'll be inlined
+    // directly into their caller's _native wrapper by
+    // InlineVMHandlersAndCleanupPass.  Uncalled handlers (discovered
+    // targets without direct call sites) need their own _native wrapper
+    // so they survive as proper native entry points in the output.
+    if (F.hasFnAttribute("omill.vm_handler") && !F.use_empty())
       continue;
     functions.push_back(&F);
   }
