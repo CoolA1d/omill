@@ -1853,6 +1853,82 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
 }
 
 void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
+  // Eliminate calls to unresolved remill-signature semantic functions.
+  // After the full pipeline + ABI recovery, any remaining
+  //   declare ptr @sub_*(ptr noalias, i64, ptr noalias)
+  // is a residual from failed dispatch resolution (bogus address outside
+  // the binary image).  Replace all calls with unreachable.
+  if (!envDisabled("OMILL_SKIP_DEAD_SEMANTIC_ELIM")) {
+    struct DeadSemanticCallEliminationPass
+        : llvm::PassInfoMixin<DeadSemanticCallEliminationPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        // Identify unresolved remill-signature declarations:
+        //   declare ptr @sub_*(ptr noalias, i64, ptr noalias)
+        llvm::SmallVector<llvm::Function *, 16> dead_semantics;
+        auto *ptr_ty = llvm::PointerType::getUnqual(M.getContext());
+        auto *i64_ty = llvm::Type::getInt64Ty(M.getContext());
+        for (auto &F : M) {
+          if (!F.isDeclaration()) continue;
+          if (!F.getName().starts_with("sub_")) continue;
+          auto *FT = F.getFunctionType();
+          if (FT->getNumParams() != 3) continue;
+          if (FT->getReturnType() != ptr_ty) continue;
+          if (FT->getParamType(0) != ptr_ty) continue;
+          if (FT->getParamType(1) != i64_ty) continue;
+          if (FT->getParamType(2) != ptr_ty) continue;
+          dead_semantics.push_back(&F);
+        }
+
+        if (dead_semantics.empty())
+          return llvm::PreservedAnalyses::all();
+
+        bool changed = false;
+        for (auto *dead_fn : dead_semantics) {
+          for (auto *user : llvm::make_early_inc_range(dead_fn->users())) {
+            auto *call = llvm::dyn_cast<llvm::CallInst>(user);
+            if (!call) continue;
+            auto *BB = call->getParent();
+            // Replace result with poison.
+            if (!call->getType()->isVoidTy())
+              call->replaceAllUsesWith(
+                  llvm::PoisonValue::get(call->getType()));
+            // Collect successors before modifying.
+            llvm::SmallVector<llvm::BasicBlock *, 2> succs;
+            if (BB->getTerminator())
+              for (auto *S : llvm::successors(BB))
+                succs.push_back(S);
+            // Erase call and everything after it.
+            while (&BB->back() != call)
+              BB->back().eraseFromParent();
+            call->eraseFromParent();
+            for (auto *S : succs)
+              S->removePredecessor(BB);
+            llvm::IRBuilder<> Builder(BB);
+            Builder.CreateUnreachable();
+            changed = true;
+          }
+        }
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(DeadSemanticCallEliminationPass{});
+
+    // After eliminating dead semantic calls, run cleanup to remove
+    // the now-dead State stores and allocas.
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FPM.addPass(llvm::ADCEPass());
+      FPM.addPass(llvm::SimplifyCFGPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
   // Replace sentinel data constants (0xCCCCCCCCCCCCCCCC from stack fill)
   // with poison.  These are reads from uninitialized stack slots that survived
   // as concrete constants through ABI recovery.  Replacing with poison lets
