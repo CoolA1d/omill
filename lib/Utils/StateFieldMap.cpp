@@ -23,17 +23,20 @@ StateFieldCategory categorizeFieldName(llvm::StringRef name) {
   }
 
   // --- AArch64 GPRs ---
-  // X0-X30, SP, PC, FP (X29), LR (X30)
-  if (name == "SP" || name == "PC" || name == "FP" || name == "LR") {
+  // X0-X30 / x0-x30, SP/sp, PC/pc, FP/fp (X29), LR/lr (X30)
+  if (name == "SP" || name == "PC" || name == "FP" || name == "LR" ||
+      name == "sp" || name == "pc" || name == "fp" || name == "lr") {
     return StateFieldCategory::kGPR;
   }
-  if (name.size() >= 2 && name.size() <= 3 && name[0] == 'X') {
+  if (name.size() >= 2 && name.size() <= 3 &&
+      (name[0] == 'X' || name[0] == 'x')) {
     unsigned reg_num = 0;
     if (!name.drop_front(1).getAsInteger(10, reg_num) && reg_num <= 30)
       return StateFieldCategory::kGPR;
   }
-  // W0-W30 (32-bit sub-registers)
-  if (name.size() >= 2 && name.size() <= 3 && name[0] == 'W') {
+  // W0-W30 / w0-w30 (32-bit sub-registers)
+  if (name.size() >= 2 && name.size() <= 3 &&
+      (name[0] == 'W' || name[0] == 'w')) {
     unsigned reg_num = 0;
     if (!name.drop_front(1).getAsInteger(10, reg_num) && reg_num <= 30)
       return StateFieldCategory::kGPR;
@@ -46,7 +49,9 @@ StateFieldCategory categorizeFieldName(llvm::StringRef name) {
   }
 
   // --- AArch64 Flags (NZCV) ---
-  if (name == "N" || name == "Z" || name == "C" || name == "V") {
+  // Remill AArch64 uses sr.n, sr.z, sr.c, sr.v (lowercase single chars).
+  if (name == "N" || name == "Z" || name == "C" || name == "V" ||
+      name == "n" || name == "z" || name == "c" || name == "v") {
     return StateFieldCategory::kFlag;
   }
 
@@ -57,9 +62,11 @@ StateFieldCategory categorizeFieldName(llvm::StringRef name) {
   }
 
   // --- AArch64 Vector registers (V0-V31 / Q0-Q31 / D0-D31 / S0-S31) ---
+  // Also lowercase: v0-v31, q0-q31, d0-d31, s0-s31
   if (name.size() >= 2 && name.size() <= 3 &&
       (name[0] == 'V' || name[0] == 'Q' || name[0] == 'D' ||
-       name[0] == 'S')) {
+       name[0] == 'S' || name[0] == 'v' || name[0] == 'q' ||
+       name[0] == 'd' || name[0] == 's')) {
     unsigned reg_num = 0;
     if (!name.drop_front(1).getAsInteger(10, reg_num) && reg_num <= 31)
       return StateFieldCategory::kVector;
@@ -83,7 +90,7 @@ StateFieldCategory categorizeFieldName(llvm::StringRef name) {
   }
 
   // AArch64 FPU control/status
-  if (name == "FPCR" || name == "FPSR") {
+  if (name == "FPCR" || name == "FPSR" || name == "fpcr" || name == "fpsr") {
     return StateFieldCategory::kFPU;
   }
 
@@ -229,10 +236,16 @@ void StateFieldMap::buildMap(llvm::Module &M) {
   }
 
   // Fallback: if __remill_basic_block was inlined/deleted, derive register
-  // names from the struct type layout.  x86-64 GPR is struct.GPR with
-  // alternating {i64 separator, Reg} pairs for 17 registers.
+  // names from the struct type layout using the struct hierarchy.
   if (!found_remill_bb && state_type_) {
-    addX86_64RegisterNames();
+    // Detect architecture by checking which arch state type exists.
+    auto *aarch64_ty = llvm::StructType::getTypeByName(
+        state_type_->getContext(), "struct.AArch64State");
+    if (aarch64_ty) {
+      addAArch64RegisterNames();
+    } else {
+      addX86_64RegisterNames();
+    }
   }
 }
 
@@ -344,6 +357,143 @@ void StateFieldMap::addX86_64RegisterNames() {
       unsigned offset = aflags_base +
           static_cast<unsigned>(aflags_layout->getElementOffset(elem_idx));
       addField(kFlagNames[i], offset, 1, StateFieldCategory::kFlag);
+    }
+  }
+}
+
+void StateFieldMap::addAArch64RegisterNames() {
+  // AArch64 remill State layout:
+  //   State = { AArch64State }
+  //   AArch64State = { ArchState, SIMD, sep, GPR, ... }
+  //   GPR = { sep, x0, sep, x1, ..., sep, x30, sep, sp, sep, pc }
+  //     Each register is a Reg union: { uint32_t dword, uint64_t qword }
+  //     Separators are volatile uint64_t.
+  auto *aarch64_ty = llvm::StructType::getTypeByName(
+      state_type_->getContext(), "struct.AArch64State");
+  if (!aarch64_ty)
+    return;
+
+  auto *gpr_ty = llvm::StructType::getTypeByName(
+      state_type_->getContext(), "struct.GPR");
+  if (!gpr_ty)
+    return;
+
+  // Find GPR base offset within AArch64State.
+  const auto *aarch64_layout = data_layout_->getStructLayout(aarch64_ty);
+  unsigned gpr_base = 0;
+  bool found_gpr = false;
+  for (unsigned i = 0; i < aarch64_ty->getNumElements(); ++i) {
+    if (aarch64_ty->getElementType(i) == gpr_ty) {
+      gpr_base = static_cast<unsigned>(aarch64_layout->getElementOffset(i));
+      found_gpr = true;
+      break;
+    }
+  }
+  if (!found_gpr)
+    return;
+
+  // GPR register order: x0..x30, sp, pc
+  // Each is at an odd element index (after a separator).
+  // struct GPR { sep, Reg x0, sep, Reg x1, ..., sep, Reg x30,
+  //              sep, Reg sp, sep, Reg pc }
+  // That's 33 registers (x0-x30 = 31, sp, pc) at indices 1,3,5,...,65.
+  const auto *gpr_layout = data_layout_->getStructLayout(gpr_ty);
+  for (unsigned i = 0; i <= 30; ++i) {
+    unsigned elem_idx = 1 + i * 2;
+    if (elem_idx >= gpr_ty->getNumElements())
+      break;
+    unsigned offset = gpr_base +
+        static_cast<unsigned>(gpr_layout->getElementOffset(elem_idx));
+    std::string name = "x" + std::to_string(i);
+    addField(name, offset, 8, StateFieldCategory::kGPR);
+    // Also add uppercase alias for lookup convenience.
+    addField("X" + std::to_string(i), offset, 8, StateFieldCategory::kGPR);
+  }
+
+  // sp is at index 31 (element 1 + 31*2 = 63)
+  {
+    unsigned elem_idx = 1 + 31 * 2;
+    if (elem_idx < gpr_ty->getNumElements()) {
+      unsigned offset = gpr_base +
+          static_cast<unsigned>(gpr_layout->getElementOffset(elem_idx));
+      addField("sp", offset, 8, StateFieldCategory::kGPR);
+      addField("SP", offset, 8, StateFieldCategory::kGPR);
+    }
+  }
+
+  // pc is at index 32 (element 1 + 32*2 = 65)
+  {
+    unsigned elem_idx = 1 + 32 * 2;
+    if (elem_idx < gpr_ty->getNumElements()) {
+      unsigned offset = gpr_base +
+          static_cast<unsigned>(gpr_layout->getElementOffset(elem_idx));
+      addField("pc", offset, 8, StateFieldCategory::kGPR);
+      addField("PC", offset, 8, StateFieldCategory::kGPR);
+    }
+  }
+
+  // Vector registers: SIMD.v[0..31], each vec128_t = 16 bytes.
+  // AArch64State layout: { ArchState(16), SIMD(512), sep(8), GPR, ... }
+  // SIMD = { [32 x vec128_t] }
+  // Find the SIMD array in AArch64State.
+  for (unsigned i = 0; i < aarch64_ty->getNumElements(); ++i) {
+    auto *elem = aarch64_ty->getElementType(i);
+    auto *st = llvm::dyn_cast<llvm::StructType>(elem);
+    if (!st) continue;
+    // SIMD struct contains a single array of vec128_t.
+    if (st->getNumElements() != 1) continue;
+    auto *arr = llvm::dyn_cast<llvm::ArrayType>(st->getElementType(0));
+    if (!arr || arr->getNumElements() < 32) continue;
+
+    unsigned simd_base = static_cast<unsigned>(
+        aarch64_layout->getElementOffset(i));
+    unsigned vreg_size = static_cast<unsigned>(
+        data_layout_->getTypeAllocSize(arr->getElementType()));
+
+    for (unsigned j = 0; j < 32; ++j) {
+      unsigned vreg_offset = simd_base + j * vreg_size;
+      addField("v" + std::to_string(j), vreg_offset, 16,
+               StateFieldCategory::kVector);
+      addField("V" + std::to_string(j), vreg_offset, 16,
+               StateFieldCategory::kVector);
+    }
+    break;
+  }
+
+  // Flags: SR struct contains n, z, c, v as uint8_t fields.
+  auto *sr_ty = llvm::StructType::getTypeByName(
+      state_type_->getContext(), "struct.SR");
+  if (sr_ty) {
+    unsigned sr_base = 0;
+    for (unsigned i = 0; i < aarch64_ty->getNumElements(); ++i) {
+      if (aarch64_ty->getElementType(i) == sr_ty) {
+        sr_base = static_cast<unsigned>(aarch64_layout->getElementOffset(i));
+        break;
+      }
+    }
+    // SR = { tpidr_el0(8), tpidrro_el0(8), sep(8), n(1), sep(1), z(1),
+    //        sep(1), c(1), sep(1), v(1), ... }
+    // The flags are at odd indices after initial fields.
+    // Find them by iterating and looking for uint8_t fields.
+    const auto *sr_layout = data_layout_->getStructLayout(sr_ty);
+    static constexpr const char *kFlagNames[] = {"n", "z", "c", "v"};
+    static constexpr const char *kFlagNamesUpper[] = {"N", "Z", "C", "V"};
+    unsigned flag_idx = 0;
+    for (unsigned i = 0; i < sr_ty->getNumElements() && flag_idx < 4; ++i) {
+      auto *fty = sr_ty->getElementType(i);
+      if (!fty->isIntegerTy(8)) continue;
+      unsigned offset = sr_base +
+          static_cast<unsigned>(sr_layout->getElementOffset(i));
+      // Skip volatile separators (odd-indexed bytes after a flag).
+      // Flags are at even positions in the flag section.
+      // Heuristic: first 4 uint8_t fields that appear after the 64-bit fields.
+      if (i >= 3) {  // Skip tpidr fields (first few are 64-bit)
+        addField(kFlagNames[flag_idx], offset, 1, StateFieldCategory::kFlag);
+        addField(kFlagNamesUpper[flag_idx], offset, 1, StateFieldCategory::kFlag);
+        flag_idx++;
+        // Skip the separator after each flag.
+        ++i;
+      }
     }
   }
 }

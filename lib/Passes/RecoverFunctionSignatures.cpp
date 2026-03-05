@@ -139,16 +139,16 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   auto *stack_top = Builder.CreateConstGEP1_64(
       Builder.getInt8Ty(), stack_alloca, kSyntheticStackSize - 0x20);
   auto *stack_top_i64 = Builder.CreatePtrToInt(stack_top, Builder.getInt64Ty());
-  // Seed the stack pointer register (RSP for x86-64, SP for AArch64).
-  for (const char *sp_name : {"RSP", "SP"}) {
+  // Seed the stack pointer register (RSP for x86-64, sp for AArch64).
+  for (const char *sp_name : {"RSP", "SP", "sp"}) {
     if (auto sp = field_map.fieldByName(sp_name); sp.has_value()) {
       auto *sp_ptr = buildStateGEP(Builder, state_alloca, sp->offset);
       Builder.CreateStore(stack_top_i64, sp_ptr);
       break;
     }
   }
-  // Seed the frame pointer register (RBP for x86-64, FP/X29 for AArch64).
-  for (const char *fp_name : {"RBP", "FP", "X29"}) {
+  // Seed the frame pointer register (RBP for x86-64, x29 for AArch64).
+  for (const char *fp_name : {"RBP", "FP", "x29", "X29"}) {
     if (auto fp = field_map.fieldByName(fp_name); fp.has_value()) {
       auto *fp_ptr = buildStateGEP(Builder, state_alloca, fp->offset);
       Builder.CreateStore(stack_top_i64, fp_ptr);
@@ -169,6 +169,7 @@ llvm::Function *createNativeWrapper(llvm::Function *lifted_fn,
   // SP-relative offsets so the lifted function can read them.
   auto sp_field = field_map.fieldByName("RSP");
   if (!sp_field) sp_field = field_map.fieldByName("SP");
+  if (!sp_field) sp_field = field_map.fieldByName("sp");
   if (sp_field.has_value()) {
     auto rsp = sp_field;
     for (unsigned i = 0; i < abi.numStackParams(); ++i) {

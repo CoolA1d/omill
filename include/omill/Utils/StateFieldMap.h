@@ -89,6 +89,10 @@ class StateFieldMap {
   /// Fallback when __remill_basic_block is unavailable.
   void addX86_64RegisterNames();
 
+  /// Derive register names from the AArch64 struct type layout.
+  /// Fallback when __remill_basic_block is unavailable.
+  void addAArch64RegisterNames();
+
   llvm::StructType *state_type_ = nullptr;
   const llvm::DataLayout *data_layout_ = nullptr;
 
