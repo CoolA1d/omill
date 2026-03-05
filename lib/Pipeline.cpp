@@ -18,6 +18,7 @@
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/IPO/AlwaysInliner.h>
+#include <llvm/Transforms/IPO/DeadArgumentElimination.h>
 #include <llvm/Transforms/IPO/GlobalDCE.h>
 #include <llvm/Transforms/IPO/Inliner.h>
 #include <llvm/Transforms/IPO/SCCP.h>
@@ -1589,7 +1590,9 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
         // Known sentinel constants (stack fill patterns).
         auto isSentinel = [](uint64_t v) -> bool {
           return v == 0xCCCCCCCCCCCCCCCCULL ||
-                 v == 0xCDCDCDCDCDCDCDCDULL;
+                 v == 0xCDCDCDCDCDCDCDCDULL ||
+                 v == 0xCCCCCCCCULL ||
+                 v == 0xCDCDCDCDULL;
         };
 
         // Check if a pointer operand is inttoptr(sentinel_constant).
@@ -1921,22 +1924,148 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::GlobalDCEPass());
   }
 
-  // Internalize _native functions whose body is just `entry: unreachable`.
-  // These are ABI wrappers for unreachable VM handler targets.  Making them
-  // internal lets GlobalDCE remove them and their callers' dead code paths.
+  // Eliminate __remill_unknown_register_ accesses (global undef).
+  if (!envDisabled("OMILL_SKIP_UNKNOWN_REG_ELIM")) {
+    struct EliminateUnknownRegisterPass
+        : llvm::PassInfoMixin<EliminateUnknownRegisterPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        auto *GV = M.getGlobalVariable("__remill_unknown_register_");
+        if (!GV) return llvm::PreservedAnalyses::all();
+        bool changed = false;
+        for (auto *user : llvm::make_early_inc_range(GV->users())) {
+          if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(user)) {
+            LI->replaceAllUsesWith(
+                llvm::Constant::getNullValue(LI->getType()));
+            LI->eraseFromParent();
+            changed = true;
+          } else if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(user)) {
+            SI->eraseFromParent();
+            changed = true;
+          }
+        }
+        if (GV->use_empty()) {
+          GV->eraseFromParent();
+          changed = true;
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(EliminateUnknownRegisterPass{});
+  }
+
+  // Iterative dead function elimination:
+  // 1. Replace calls to unreachable-body functions with unreachable.
+  // 2. SimplifyCFG + ADCE to remove dead code in callers.
+  // 3. Internalize newly-unreachable _native functions → GlobalDCE.
+  // Iterate because eliminating one layer of dead calls can create new
+  // unreachable-body functions (when the only non-dead path called a dead fn).
   if (!envDisabled("OMILL_SKIP_DEAD_NATIVE_INTERN")) {
-    struct InternalizeDeadNativesPass
-        : llvm::PassInfoMixin<InternalizeDeadNativesPass> {
+    struct PropagateUnreachableCallsPass
+        : llvm::PassInfoMixin<PropagateUnreachableCallsPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        // Collect functions with unreachable-only body.
+        llvm::SmallPtrSet<llvm::Function *, 32> dead_fns;
+        for (auto &F : M) {
+          if (F.isDeclaration() || F.empty()) continue;
+          if (F.size() != 1) continue;
+          auto &entry = F.getEntryBlock();
+          if (entry.size() == 1 &&
+              llvm::isa<llvm::UnreachableInst>(entry.front()))
+            dead_fns.insert(&F);
+        }
+        if (dead_fns.empty())
+          return llvm::PreservedAnalyses::all();
+
+        bool changed = false;
+        for (auto &F : M) {
+          if (F.isDeclaration()) continue;
+          if (dead_fns.count(&F)) continue;
+          for (auto &BB : F) {
+            for (auto &I : llvm::make_early_inc_range(BB)) {
+              auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
+              if (!call) continue;
+              auto *callee = call->getCalledFunction();
+              if (!callee || !dead_fns.count(callee)) continue;
+              // Replace call result with poison.
+              if (!call->getType()->isVoidTy())
+                call->replaceAllUsesWith(
+                    llvm::PoisonValue::get(call->getType()));
+              // Collect successors, erase tail, add unreachable.
+              llvm::SmallVector<llvm::BasicBlock *, 2> succs;
+              if (BB.getTerminator())
+                for (auto *S : llvm::successors(&BB))
+                  succs.push_back(S);
+              while (&BB.back() != call)
+                BB.back().eraseFromParent();
+              call->eraseFromParent();
+              for (auto *S : succs)
+                S->removePredecessor(&BB);
+              llvm::IRBuilder<> Builder(&BB);
+              Builder.CreateUnreachable();
+              changed = true;
+              break;
+            }
+          }
+        }
+
+        // Internalize dead _native functions.
+        for (auto *F : dead_fns) {
+          if (F->getName().ends_with("_native") &&
+              !F->hasLocalLinkage()) {
+            F->setLinkage(llvm::GlobalValue::InternalLinkage);
+            changed = true;
+          }
+        }
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    // Single pass: propagate unreachable from functions that were ALREADY
+    // dead before this pipeline.  Don't iterate — iteration would cascade
+    // through noreturn call chains (vmexit → vmenter → handler → entry),
+    // incorrectly killing live functions.
+    MPM.addPass(PropagateUnreachableCallsPass{});
+    {
+      llvm::FunctionPassManager FPM;
+      FPM.addPass(llvm::SimplifyCFGPass());
+      FPM.addPass(llvm::ADCEPass());
+      MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    }
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+  // Dead argument/return elimination: remove unused return values from
+  // _native functions with internal linkage.  Requires internalization first,
+  // since DAE only works on internal functions.
+  if (!envDisabled("OMILL_SKIP_DEAD_ARG_ELIM")) {
+    // Internalize non-entry _native functions so DAE can optimize them.
+    struct InternalizeForDAEPass
+        : llvm::PassInfoMixin<InternalizeForDAEPass> {
       llvm::PreservedAnalyses run(llvm::Module &M,
                                    llvm::ModuleAnalysisManager &) {
         bool changed = false;
         for (auto &F : M) {
-          if (F.isDeclaration()) continue;
+          if (F.isDeclaration() || F.hasLocalLinkage()) continue;
           if (!F.getName().ends_with("_native")) continue;
-          if (F.size() != 1) continue;
-          auto &entry = F.getEntryBlock();
-          if (entry.size() != 1) continue;
-          if (!llvm::isa<llvm::UnreachableInst>(entry.front())) continue;
+          // Keep the entry point (function matching --va address) external.
+          // Entry points are called from outside the module.
+          // Heuristic: entry _native functions have no callers within the module.
+          bool has_internal_caller = false;
+          for (auto *user : F.users()) {
+            if (llvm::isa<llvm::CallInst>(user) ||
+                llvm::isa<llvm::InvokeInst>(user)) {
+              has_internal_caller = true;
+              break;
+            }
+          }
+          if (!has_internal_caller) continue;
           F.setLinkage(llvm::GlobalValue::InternalLinkage);
           changed = true;
         }
@@ -1945,8 +2074,8 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
       }
       static bool isRequired() { return true; }
     };
-    MPM.addPass(InternalizeDeadNativesPass{});
-    MPM.addPass(llvm::GlobalDCEPass());
+    MPM.addPass(InternalizeForDAEPass{});
+    MPM.addPass(llvm::DeadArgumentEliminationPass());
   }
 
   // Split large native_stack allocas and promote to SSA.
@@ -1980,10 +2109,16 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
         auto isSentinelConst = [](llvm::ConstantInt *CI) -> bool {
           if (!CI || CI->getBitWidth() < 16) return false;
           uint64_t v = CI->getZExtValue();
+          // Full-width 0xCCCC... pattern.
           uint64_t mask = (CI->getBitWidth() == 64)
               ? 0xFFFFFFFFFFFFFFFFULL
               : (1ULL << CI->getBitWidth()) - 1;
-          return (v & mask) == (0xCCCCCCCCCCCCCCCCULL & mask);
+          if ((v & mask) == (0xCCCCCCCCCCCCCCCCULL & mask))
+            return true;
+          // 32-bit sentinel zero-extended in a 64-bit value.
+          if (CI->getBitWidth() == 64 && v == 0xCCCCCCCCULL)
+            return true;
+          return false;
         };
 
         auto isSentinelPtr = [&](llvm::Value *ptr) -> bool {
