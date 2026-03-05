@@ -13,6 +13,12 @@
 #include <llvm/Object/ObjectFile.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/IPO/Inliner.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/ADCE.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/InitLLVM.h>
@@ -1754,6 +1760,27 @@ int main(int argc, char **argv) {
     });
   }
 
+  auto runPostPatchCleanup = [&](StringRef reason) {
+    ModulePassManager MPM;
+    llvm::InlineParams params = llvm::getInlineParams(80);
+    MPM.addPass(llvm::ModuleInlinerWrapperPass(params));
+
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    FPM.addPass(llvm::ADCEPass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    MPM.addPass(llvm::GlobalDCEPass());
+    MPM.run(*module, MAM);
+
+    if (events.detailed()) {
+      events.emitInfo("post_patch_cleanup_completed",
+                      "post patch cleanup completed",
+                      {{"reason", reason.str()}});
+    }
+  };
+
   // Run the main pipeline (without ABI first)
   omill::PipelineOptions opts;
   opts.target_arch = target_arch;
@@ -2097,6 +2124,8 @@ int main(int argc, char **argv) {
         events.emitInfo("abi_patch_callsites", "patched inttoptr callsites",
                         {{"patched_uses", static_cast<int64_t>(patched)}});
       }
+      if (patched > 0)
+        runPostPatchCleanup("abi_patch_callsites");
     }
 
     // Post-ABI deobfuscation on _native functions.  When recover_abi is
@@ -2214,6 +2243,7 @@ int main(int argc, char **argv) {
       omill::TraceLifter late_lifter(late_arch.get(), late_manager);
 
       // Lift the target functions and their full callee graphs.
+      unsigned late_patched = 0;
       for (uint64_t pc : late_targets) {
         late_lifter.Lift(pc);
       }
@@ -2359,8 +2389,10 @@ int main(int argc, char **argv) {
         // Case 1: ConstantExpr inttoptr — RAUW replaces all uses globally.
         auto *itp = llvm::ConstantExpr::getIntToPtr(
             pc_ci, llvm::PointerType::getUnqual(ctx));
-        if (itp->getNumUses() > 0)
+        if (itp->getNumUses() > 0) {
+          late_patched += itp->getNumUses();
           itp->replaceAllUsesWith(target_fn);
+        }
 
         // Case 2: IntToPtrInst instructions with this constant operand.
         // Each instruction is a separate Value, so scan and replace each.
@@ -2371,9 +2403,20 @@ int main(int argc, char **argv) {
           auto *inst = llvm::dyn_cast<llvm::IntToPtrInst>(user);
           if (!inst)
             continue;
+          late_patched += inst->getNumUses();
           inst->replaceAllUsesWith(target_fn);
           if (inst->use_empty())
             inst->eraseFromParent();
+        }
+      }
+      if (late_patched > 0) {
+        runPostPatchCleanup("late_discovery_callsites");
+        if (events.detailed()) {
+          events.emitInfo("late_discovery_patch_callsites",
+                          "patched late inttoptr callsites",
+                          {{"round", static_cast<int64_t>(round + 1)},
+                           {"patched_uses",
+                            static_cast<int64_t>(late_patched)}});
         }
       }
 

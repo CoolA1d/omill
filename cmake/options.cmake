@@ -3,6 +3,18 @@ option(OMILL_ENABLE_TOOLS "Build omill-opt CLI tool" ON)
 option(OMILL_ENABLE_REMILL "Build with remill for e2e testing" OFF)
 option(OMILL_ENABLE_SIMPLIFIER "Build with EqSat MBA simplifier" OFF)
 option(OMILL_ENABLE_Z3 "Build with Z3 constraint-based dispatch solver" OFF)
+option(OMILL_AUTO_FETCH_QT
+  "Automatically download Qt6 for omill-lift-ui when Qt6 is not installed"
+  ON)
+
+set(OMILL_QT_VERSION "6.8.2" CACHE STRING
+  "Qt version used by omill-lift-ui auto-fetch")
+set(OMILL_QT_ARCH "win64_msvc2022_64" CACHE STRING
+  "Qt architecture package used by omill-lift-ui auto-fetch")
+set(OMILL_QT_MODULES "" CACHE STRING
+  "Semicolon-separated Qt modules to install with aqt")
+set(OMILL_QT_DOWNLOAD_TIMEOUT "20" CACHE STRING
+  "Connection timeout (seconds) for aqt Qt downloads")
 
 set(OMILL_LLVM_COMPONENTS
   Core

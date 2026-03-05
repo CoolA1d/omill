@@ -140,6 +140,18 @@ Available options:
 - `--resolve-targets`: Enable iterative indirect branch resolution via Z3/SCEV.
 - `--refine-signatures`: Enable parameter type refinement after ABI recovery.
 - `--no-abi`: Skip ABI recovery (keep `State` struct and remill intrinsics).
+- `--event-jsonl <path|->`: Emit structured lifecycle events as JSONL.
+- `--event-detail <basic|detailed>`: Control event granularity for `--event-jsonl`.
+
+### omill-lift-ui (Qt desktop UI)
+
+`omill-lift-ui` is a Windows x64 desktop frontend for `omill-lift` that runs jobs via subprocesses, ingests `--event-jsonl` streams, and provides queue/session controls (start, cancel, retry, duplicate, reorder, enable/disable), phase timeline, logs, and artifact tracking.
+
+If Qt6 is missing, CMake can auto-fetch prebuilt Qt via `aqt`:
+- `-DOMILL_AUTO_FETCH_QT=ON` (default)
+- `-DOMILL_QT_VERSION=6.8.2`
+- `-DOMILL_QT_ARCH=win64_msvc2022_64`
+- `-DOMILL_QT_MODULES=` (optional extra modules, semicolon-separated)
 
 ## Architecture
 

@@ -2,6 +2,7 @@
 
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
@@ -35,6 +36,8 @@
 #if OMILL_ENABLE_Z3
 #include "omill/Passes/Z3DispatchSolver.h"
 #endif
+
+#include <optional>
 
 namespace omill {
 
@@ -109,12 +112,48 @@ void runFPMOnFunctions(llvm::FunctionPassManager &FPM,
 llvm::DenseSet<uint64_t> collectNewTargetPCs(
     llvm::Module &M, const LiftedFunctionMap *lifted) {
   llvm::DenseSet<uint64_t> new_pcs;
+
+  auto maybeCollectTarget = [&](uint64_t target_pc) {
+    if (target_pc == 0)
+      return;
+    if (lifted && lifted->lookup(target_pc))
+      return;
+    new_pcs.insert(target_pc);
+  };
+
+  auto extractIntToPtrConstTarget = [&](llvm::Value *callee_op)
+      -> std::optional<uint64_t> {
+    if (!callee_op)
+      return std::nullopt;
+    callee_op = callee_op->stripPointerCasts();
+
+    llvm::ConstantInt *ci = nullptr;
+    if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_op)) {
+      if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+        ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+    }
+    if (!ci) {
+      if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_op))
+        ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
+    }
+    if (!ci)
+      return std::nullopt;
+    return ci->getZExtValue();
+  };
+
   for (auto &F : M) {
     for (auto &BB : F) {
       for (auto &I : BB) {
         auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
         if (!call)
           continue;
+
+        if (!call->getCalledFunction()) {
+          if (auto target = extractIntToPtrConstTarget(call->getCalledOperand()))
+            maybeCollectTarget(*target);
+          continue;
+        }
+
         auto *callee = call->getCalledFunction();
         if (!callee)
           continue;
@@ -126,13 +165,7 @@ llvm::DenseSet<uint64_t> collectNewTargetPCs(
         auto *pc_arg = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1));
         if (!pc_arg)
           continue;
-        uint64_t target_pc = pc_arg->getZExtValue();
-        if (target_pc == 0)
-          continue;
-        // Check if a lifted function already exists.
-        if (lifted && lifted->lookup(target_pc))
-          continue;
-        new_pcs.insert(target_pc);
+        maybeCollectTarget(pc_arg->getZExtValue());
       }
     }
   }

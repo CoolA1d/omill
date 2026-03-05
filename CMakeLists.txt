@@ -89,6 +89,7 @@ if(OMILL_ENABLE_TOOLS)
   add_subdirectory(tools/ollvm-plugin)
   if(OMILL_ENABLE_REMILL)
     add_subdirectory(tools/omill-lift)
+    add_subdirectory(tools/omill-lift-ui)
   endif()
 endif()
 

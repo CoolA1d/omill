@@ -65,6 +65,7 @@ add_executable(omill-unit-tests
   unit/HyperCallCodegenTest.cpp
   unit/IterativeTargetResolutionTest.cpp
   unit/PassRegistryTest.cpp
+  unit/LiftRunContractTest.cpp
   unit/RewriteLiftedCallsToNativeTest.cpp
   unit/ResolveForcedExceptionsTest.cpp
   unit/SimplifyVectorFlagComputationTest.cpp
@@ -102,6 +103,16 @@ add_executable(omill-unit-tests
   unit/RemillIntrinsicAnalysisTest.cpp
   unit/PipelineTest.cpp
 )
+
+if(OMILL_ENABLE_REMILL AND OMILL_ENABLE_TOOLS)
+  target_sources(omill-unit-tests PRIVATE
+    unit/OmillLiftEventIntegrationTest.cpp
+  )
+  add_dependencies(omill-unit-tests omill-lift)
+  target_compile_definitions(omill-unit-tests PRIVATE
+    OMILL_LIFT_EXE_PATH="$<TARGET_FILE:omill-lift>"
+  )
+endif()
 
 target_link_libraries(omill-unit-tests
   PRIVATE

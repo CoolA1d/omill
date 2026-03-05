@@ -2,14 +2,17 @@
 
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/DCE.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
@@ -27,6 +30,7 @@
 #include <llvm/Transforms/Scalar/LoopRotation.h>
 #include <llvm/Transforms/Scalar/LoopUnrollPass.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -95,6 +99,7 @@
 #include "omill/Passes/MergeBytePhis.h"
 #include "omill/Passes/RecoverAllocaPointers.h"
 #include "omill/Analysis/TargetArchAnalysis.h"
+#include "omill/Utils/LiftedNames.h"
 
 namespace omill {
 
@@ -143,6 +148,73 @@ std::optional<uint32_t> envUint32(const char *name) {
   unsigned long n = std::strtoul(v, &end, 0);
   if (end == v || (end && *end != '\0')) return std::nullopt;
   return static_cast<uint32_t>(n);
+}
+
+bool envBoolEnabled(const char *name) {
+  const char *v = std::getenv(name);
+  if (!v || v[0] == '\0')
+    return false;
+  auto sv = llvm::StringRef(v).lower();
+  return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
+}
+
+bool emitInlineDiagMarkers() {
+  if (envBoolEnabled("OMILL_SKIP_INLINE_DIAG_MARKERS"))
+    return false;
+  const char *force = std::getenv("OMILL_INLINE_DIAG_MARKERS");
+  if (!force || force[0] == '\0')
+    return true;
+  auto sv = llvm::StringRef(force).lower();
+  return !(sv == "0" || sv == "false" || sv == "off" || sv == "no");
+}
+
+void emitInlineDiagMarker(llvm::CallBase &call, llvm::Function &callee,
+                          llvm::StringRef phase) {
+  auto *caller = call.getFunction();
+  if (!caller)
+    return;
+
+  auto &M = *caller->getParent();
+  auto &Ctx = M.getContext();
+  auto *i8_ptr_ty = llvm::PointerType::getUnqual(Ctx);
+
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << "omill.inline phase=" << phase << "; caller=" << caller->getName()
+     << "; callee=" << callee.getName();
+  if (callee.getName().starts_with("sub_"))
+    os << "; callee_va=0x" << llvm::utohexstr(extractEntryVA(callee.getName()));
+  os.flush();
+
+  auto *str_data = llvm::ConstantDataArray::getString(Ctx, text, true);
+  auto *str_gv = new llvm::GlobalVariable(
+      M, str_data->getType(), true, llvm::GlobalValue::PrivateLinkage, str_data,
+      "__omill_inline_diag");
+  str_gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+  str_gv->setAlignment(llvm::Align(1));
+  str_gv->setSection(".omill.inline.diag");
+
+  auto *sink = M.getGlobalVariable("__omill_inline_diag_sink");
+  if (!sink) {
+    sink = new llvm::GlobalVariable(
+        M, i8_ptr_ty, false, llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantPointerNull::get(i8_ptr_ty), "__omill_inline_diag_sink");
+    sink->setAlignment(llvm::Align(8));
+    sink->setSection(".omill.inline.diag");
+  }
+
+  auto *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), 0);
+  llvm::SmallVector<llvm::Constant *, 2> idxs{zero, zero};
+  llvm::Constant *str_ptr = llvm::ConstantExpr::getInBoundsGetElementPtr(
+      str_data->getType(), str_gv, idxs);
+  if (str_ptr->getType() != i8_ptr_ty)
+    str_ptr = llvm::ConstantExpr::getPointerCast(str_ptr, i8_ptr_ty);
+
+  llvm::IRBuilder<> B(&call);
+  auto *store = B.CreateStore(str_ptr, sink, /*isVolatile=*/true);
+  store->setAlignment(llvm::Align(8));
+
+  llvm::appendToUsed(M, {str_gv, sink});
 }
 
 /// Split large [N x i8] allocas into per-region allocas based on
@@ -912,6 +984,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
         // so we can find them after inlining (Function* may be invalidated).
         bool has_vm_handlers = false;
         llvm::SmallVector<std::string, 16> caller_names;
+        llvm::DenseSet<llvm::Function *> inline_targets;
         for (auto &F : M) {
           if (!F.hasFnAttribute("omill.vm_handler"))
             continue;
@@ -931,6 +1004,7 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
           F.removeFnAttr(llvm::Attribute::NoInline);
           F.addFnAttr(llvm::Attribute::AlwaysInline);
           has_vm_handlers = true;
+          inline_targets.insert(&F);
           for (auto *U : F.users()) {
             if (auto *CB = llvm::dyn_cast<llvm::CallBase>(U))
               caller_names.push_back(CB->getFunction()->getName().str());
@@ -938,6 +1012,17 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
         }
         if (!has_vm_handlers)
           return llvm::PreservedAnalyses::all();
+
+        if (emitInlineDiagMarkers()) {
+          for (auto *handler : inline_targets) {
+            for (auto *U : handler->users()) {
+              auto *CB = llvm::dyn_cast<llvm::CallBase>(U);
+              if (!CB)
+                continue;
+              emitInlineDiagMarker(*CB, *handler, "abi_vm_handler_inline");
+            }
+          }
+        }
 
         // Inline the marked functions.
         {
@@ -1580,7 +1665,8 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   // After deobfuscation has simplified individual functions, small functions
   // called from multiple dispatch sites are likely VM handlers.  Inlining
   // exposes their bodies to further optimization.
-  if (opts.deobfuscate && !envDisabled("OMILL_SKIP_VM_HANDLER_INLINE")) {
+  if (opts.vm_devirtualize && opts.deobfuscate &&
+      !envDisabled("OMILL_SKIP_VM_HANDLER_INLINE")) {
     MPM.addPass(VMHandlerInlinerPass());
     // Re-run cleanup only on functions that had handlers inlined.
     llvm::FunctionPassManager FPM;
@@ -1740,15 +1826,23 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
               auto *call = llvm::dyn_cast<llvm::CallInst>(&I);
               if (!call)
                 continue;
+              if (call->getCalledFunction())
+                continue;
 
               // Match: call ... inttoptr(i64 CONST to ptr)(...)
-              auto *callee_val = call->getCalledOperand();
+              auto *callee_val = call->getCalledOperand()->stripPointerCasts();
               llvm::ConstantInt *addr_ci = nullptr;
 
               // ConstantExpr inttoptr.
               if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(callee_val)) {
                 if (ce->getOpcode() == llvm::Instruction::IntToPtr)
                   addr_ci = llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0));
+              }
+              // IntToPtrInst inttoptr(CONST).
+              if (!addr_ci) {
+                if (auto *itp = llvm::dyn_cast<llvm::IntToPtrInst>(callee_val)) {
+                  addr_ci = llvm::dyn_cast<llvm::ConstantInt>(itp->getOperand(0));
+                }
               }
               if (!addr_ci)
                 continue;
