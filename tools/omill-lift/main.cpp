@@ -1443,6 +1443,15 @@ int main(int argc, char **argv) {
              << dispatch_targets.size() << " dispatch + "
              << call_targets.size() << " call target(s)\n";
 
+      // Snapshot existing functions before lifting so we can tag ALL new ones
+      // (not just the top-level targets) with omill.vm_newly_lifted.
+      // Without this, callee functions created by the lifter's graph walk
+      // miss Phase 1 intrinsic lowering (the scoped pipeline only processes
+      // functions with the newly_lifted attribute).
+      llvm::DenseSet<llvm::Function *> pre_lift_funcs;
+      for (auto &F : *module)
+        pre_lift_funcs.insert(&F);
+
       // Lift dispatch targets as VM handlers.
       unsigned lift_ok = 0, lift_fail = 0;
       for (uint64_t va : dispatch_targets) {
@@ -1450,10 +1459,8 @@ int main(int argc, char **argv) {
           ++lift_ok;
           std::string name =
               "sub_" + llvm::Twine::utohexstr(va).str();
-          if (auto *fn = module->getFunction(name)) {
+          if (auto *fn = module->getFunction(name))
             fn->addFnAttr("omill.vm_handler");
-            fn->addFnAttr("omill.vm_newly_lifted");
-          }
         } else {
           ++lift_fail;
         }
@@ -1461,15 +1468,16 @@ int main(int argc, char **argv) {
       // Lift call targets as regular functions (NOT vm_handler — they
       // get _native wrappers via RecoverFunctionSignatures).
       for (uint64_t va : call_targets) {
-        if (lifter.Lift(va)) {
+        if (lifter.Lift(va))
           ++lift_ok;
-          std::string name =
-              "sub_" + llvm::Twine::utohexstr(va).str();
-          if (auto *fn = module->getFunction(name))
-            fn->addFnAttr("omill.vm_newly_lifted");
-        } else {
+        else
           ++lift_fail;
-        }
+      }
+
+      // Tag ALL functions that were added by the lifter during this round.
+      for (auto &F : *module) {
+        if (!pre_lift_funcs.count(&F) && !F.isDeclaration())
+          F.addFnAttr("omill.vm_newly_lifted");
       }
 
       // Fix DeclareLiftedFunction naming collisions.

@@ -653,6 +653,22 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(RewriteLiftedCallsToNativePass());
   }
 
+  // Lower any remill intrinsics that survived into _native wrappers.
+  // This happens when lifted functions still contain __remill_read_memory_*,
+  // __remill_flag_computation_*, etc. (e.g., VM discovery callees that weren't
+  // processed by the scoped Phase 1).  After AlwaysInlinerPass inlined those
+  // lifted functions into _native wrappers, the intrinsic calls appear directly
+  // in the wrapper bodies.  Lower them now before SROA decomposes the State.
+  {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(LowerRemillIntrinsicsPass(
+        LowerCategories::Flags | LowerCategories::Barriers |
+        LowerCategories::Memory | LowerCategories::Atomics |
+        LowerCategories::HyperCalls | LowerCategories::ErrorMissing |
+        LowerCategories::Undefined));
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
   addPhaseMarker(MPM, "ABI: DSE+SROA+i128");
   // Eliminate dead stores to volatile State fields, decompose the State
   // alloca via SROA, and expand i128 div/rem — all in a single traversal.

@@ -870,8 +870,8 @@ void lowerAsyncHyperCall(llvm::CallInst *CI) {
       is_noreturn = (vector == 0x29);
       break;
     }
-    case 1: {  // kX86Int1 — single-step trap
-      auto *IA = llvm::InlineAsm::get(void_fn_ty, "int1", "",
+    case 1: {  // kX86Int1 — software interrupt 1
+      auto *IA = llvm::InlineAsm::get(void_fn_ty, "int $$1", "",
                                       /*hasSideEffects=*/true);
       Builder.CreateCall(IA);
       break;
@@ -1119,6 +1119,11 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
     llvm::CallInst *CI;
     IntrinsicKind kind;
   };
+  // Only collect the FIRST error/missing call per block.  After semantic
+  // inlining, a block may contain multiple such calls.  Processing the first
+  // one inserts a `ret` and erases everything after it, so later calls in
+  // the same block would become dangling pointers.
+  llvm::DenseSet<llvm::BasicBlock *> seen_blocks;
   llvm::SmallVector<PendingCall, 4> pending;
 
   for (auto &BB : F)
@@ -1127,7 +1132,8 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
         auto kind = table.classifyCall(CI);
         if (kind == IntrinsicKind::kError ||
             kind == IntrinsicKind::kMissingBlock)
-          pending.push_back({CI, kind});
+          if (seen_blocks.insert(&BB).second)
+            pending.push_back({CI, kind});
       }
 
   if (pending.empty())
@@ -1179,13 +1185,20 @@ bool lowerErrorAndMissing(llvm::Function &F, IntrinsicTable &table) {
 // ===----------------------------------------------------------------------===
 
 bool lowerFunctionReturn(llvm::Function &F, IntrinsicTable &table) {
+  // Only collect the FIRST __remill_function_return per block.
+  // After semantic inlining, a block may contain multiple return intrinsics
+  // from different inlined callees.  Processing the first one inserts a `ret`
+  // and erases everything after it (including subsequent return calls), so
+  // keeping later calls in the worklist would leave dangling pointers.
+  llvm::DenseSet<llvm::BasicBlock *> seen_blocks;
   llvm::SmallVector<llvm::CallInst *, 4> return_calls;
 
   for (auto &BB : F)
     for (auto &I : BB)
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
         if (table.classifyCall(CI) == IntrinsicKind::kFunctionReturn)
-          return_calls.push_back(CI);
+          if (seen_blocks.insert(&BB).second)
+            return_calls.push_back(CI);
 
   if (return_calls.empty())
     return false;
@@ -1281,13 +1294,18 @@ bool lowerJump(llvm::Function &F, IntrinsicTable &table,
   auto &M = *F.getParent();
   auto &Ctx = F.getContext();
 
+  // Only collect the FIRST __remill_jump per block — same rationale as
+  // lowerFunctionReturn: processing the first inserts a terminator and
+  // erases everything after it, invalidating later calls in the same block.
+  llvm::DenseSet<llvm::BasicBlock *> seen_blocks;
   llvm::SmallVector<llvm::CallInst *, 8> jump_calls;
 
   for (auto &BB : F)
     for (auto &I : BB)
       if (auto *CI = llvm::dyn_cast<llvm::CallInst>(&I))
         if (table.classifyCall(CI) == IntrinsicKind::kJump)
-          jump_calls.push_back(CI);
+          if (seen_blocks.insert(&BB).second)
+            jump_calls.push_back(CI);
 
   if (jump_calls.empty())
     return false;
