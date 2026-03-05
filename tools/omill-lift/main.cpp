@@ -1922,6 +1922,13 @@ int main(int argc, char **argv) {
               "identify the culprit pass)\n";
   }
 
+  // Late cleanup: replace sentinel data constants with poison, DCE.
+  {
+    ModulePassManager MPM;
+    omill::buildLateCleanupPipeline(MPM);
+    MPM.run(*module, MAM);
+  }
+
   // Write final output
   std::error_code EC;
   ToolOutputFile Out(OutputFilename, EC, sys::fs::OF_Text);

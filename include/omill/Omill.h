@@ -98,6 +98,10 @@ void buildABIRecoveryPipeline(llvm::ModulePassManager &MPM);
 /// Build only the deobfuscation stage (Stage 6).
 void buildDeobfuscationPipeline(llvm::FunctionPassManager &FPM);
 
+/// Build the late cleanup pipeline (sentinel data elimination + DCE).
+/// Run after ABI recovery and post-ABI deobfuscation, before output.
+void buildLateCleanupPipeline(llvm::ModulePassManager &MPM);
+
 /// Register all omill function-level analyses.
 void registerAnalyses(llvm::FunctionAnalysisManager &FAM);
 

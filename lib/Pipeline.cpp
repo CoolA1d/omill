@@ -1852,6 +1852,181 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
   MPM.addPass(llvm::GlobalDCEPass());
 }
 
+void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
+  // Replace sentinel data constants (0xCCCCCCCCCCCCCCCC from stack fill)
+  // with poison.  These are reads from uninitialized stack slots that survived
+  // as concrete constants through ABI recovery.  Replacing with poison lets
+  // ADCE/SimplifyCFG eliminate dead code paths that depend on them.
+  //
+  // Must run AFTER ABI recovery + post-ABI deobfuscation, since those stages
+  // create _native wrappers with native_stack memset(0xCC) fills.
+  if (!envDisabled("OMILL_SKIP_SENTINEL_DATA_ELIM")) {
+    struct SentinelDataEliminationPass
+        : llvm::PassInfoMixin<SentinelDataEliminationPass> {
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration())
+          return llvm::PreservedAnalyses::all();
+
+        auto isSentinelConst = [](llvm::ConstantInt *CI) -> bool {
+          if (!CI || CI->getBitWidth() < 16) return false;
+          uint64_t v = CI->getZExtValue();
+          uint64_t mask = (CI->getBitWidth() == 64)
+              ? 0xFFFFFFFFFFFFFFFFULL
+              : (1ULL << CI->getBitWidth()) - 1;
+          return (v & mask) == (0xCCCCCCCCCCCCCCCCULL & mask);
+        };
+
+        auto isSentinelPtr = [&](llvm::Value *ptr) -> bool {
+          // ConstantExpr inttoptr(sentinel).
+          if (auto *ce = llvm::dyn_cast<llvm::ConstantExpr>(ptr)) {
+            if (ce->getOpcode() == llvm::Instruction::IntToPtr)
+              return isSentinelConst(
+                  llvm::dyn_cast<llvm::ConstantInt>(ce->getOperand(0)));
+          }
+          // IntToPtrInst with sentinel.
+          if (auto *i2p = llvm::dyn_cast<llvm::IntToPtrInst>(ptr))
+            return isSentinelConst(
+                llvm::dyn_cast<llvm::ConstantInt>(i2p->getOperand(0)));
+          return false;
+        };
+
+        bool changed = false;
+
+        for (auto &BB : F) {
+          for (auto &I : llvm::make_early_inc_range(BB)) {
+            // Eliminate load/store/cmpxchg to sentinel pointer.
+            if (auto *ld = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+              if (isSentinelPtr(ld->getPointerOperand())) {
+                ld->replaceAllUsesWith(
+                    llvm::PoisonValue::get(ld->getType()));
+                ld->eraseFromParent();
+                changed = true;
+              }
+              continue;
+            }
+            if (auto *st = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+              if (isSentinelPtr(st->getPointerOperand())) {
+                st->eraseFromParent();
+                changed = true;
+                continue;
+              }
+              // Store of sentinel value → dead store (uninitialized data).
+              if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
+                      st->getValueOperand())) {
+                if (isSentinelConst(CI)) {
+                  st->eraseFromParent();
+                  changed = true;
+                }
+              }
+              continue;
+            }
+            if (auto *cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&I)) {
+              if (isSentinelPtr(cx->getPointerOperand())) {
+                cx->replaceAllUsesWith(
+                    llvm::PoisonValue::get(cx->getType()));
+                cx->eraseFromParent();
+                changed = true;
+              }
+              continue;
+            }
+
+            if (auto *call = llvm::dyn_cast<llvm::CallInst>(&I)) {
+              // Calls to sentinel address → unreachable.
+              if (isSentinelPtr(call->getCalledOperand())) {
+                if (!call->getType()->isVoidTy())
+                  call->replaceAllUsesWith(
+                      llvm::PoisonValue::get(call->getType()));
+                llvm::SmallVector<llvm::BasicBlock *, 2> succs;
+                if (BB.getTerminator())
+                  for (auto *S : llvm::successors(&BB))
+                    succs.push_back(S);
+                while (&BB.back() != call)
+                  BB.back().eraseFromParent();
+                call->eraseFromParent();
+                for (auto *S : succs)
+                  S->removePredecessor(&BB);
+                llvm::IRBuilder<> Builder(&BB);
+                Builder.CreateUnreachable();
+                changed = true;
+                break;
+              }
+              // Replace sentinel constants in call arguments.
+              for (unsigned i = 0; i < call->arg_size(); ++i) {
+                auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
+                    call->getArgOperand(i));
+                if (isSentinelConst(CI)) {
+                  call->setArgOperand(i,
+                      llvm::PoisonValue::get(CI->getType()));
+                  changed = true;
+                }
+              }
+              continue;
+            }
+            if (auto *ret = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+              if (auto *rv = ret->getReturnValue()) {
+                if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(rv)) {
+                  if (isSentinelConst(CI)) {
+                    ret->setOperand(0,
+                        llvm::PoisonValue::get(CI->getType()));
+                    changed = true;
+                  }
+                }
+                // Handle ret { i64 sentinel } (ConstantStruct/Aggregate).
+                if (auto *CA = llvm::dyn_cast<llvm::Constant>(rv)) {
+                  if (!llvm::isa<llvm::ConstantInt>(CA)) {
+                    bool has_sentinel = false;
+                    for (unsigned i = 0; i < CA->getNumOperands(); ++i) {
+                      if (isSentinelConst(
+                              llvm::dyn_cast<llvm::ConstantInt>(
+                                  CA->getOperand(i)))) {
+                        has_sentinel = true;
+                        break;
+                      }
+                    }
+                    if (has_sentinel) {
+                      ret->setOperand(0,
+                          llvm::PoisonValue::get(rv->getType()));
+                      changed = true;
+                    }
+                  }
+                }
+              }
+              continue;
+            }
+            if (auto *IV = llvm::dyn_cast<llvm::InsertValueInst>(&I)) {
+              if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(
+                      IV->getInsertedValueOperand())) {
+                if (isSentinelConst(CI)) {
+                  IV->setOperand(1,
+                      llvm::PoisonValue::get(CI->getType()));
+                  changed = true;
+                }
+              }
+              continue;
+            }
+          }
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(SentinelDataEliminationPass{});
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Cleanup after sentinel elimination.
+  {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::SimplifyCFGPass());
+    FPM.addPass(llvm::ADCEPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+  MPM.addPass(llvm::GlobalDCEPass());
+}
+
 void registerModuleAnalyses(llvm::ModuleAnalysisManager &MAM) {
   MAM.registerPass([&] { return CallGraphAnalysis(); });
   MAM.registerPass([&] { return CallingConventionAnalysis(); });
