@@ -143,6 +143,143 @@ std::optional<uint32_t> envUint32(const char *name) {
   return static_cast<uint32_t>(n);
 }
 
+/// Split large [N x i8] allocas into per-region allocas based on
+/// constant-offset GEP clustering.  Enables SROA on oversized allocas
+/// (e.g., 69KB native_stack from ABI recovery) that SROA skips.
+struct SplitLargeAllocaPass
+    : llvm::PassInfoMixin<SplitLargeAllocaPass> {
+  static constexpr uint64_t kSizeThreshold = 4096;
+  static constexpr int64_t kGapTolerance = 16;
+  static constexpr int64_t kRegionPadding = 8;
+
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                               llvm::FunctionAnalysisManager &) {
+    if (F.isDeclaration())
+      return llvm::PreservedAnalyses::all();
+
+    auto &DL = F.getDataLayout();
+    auto *i8_ty = llvm::Type::getInt8Ty(F.getContext());
+    bool changed = false;
+
+    llvm::SmallVector<llvm::AllocaInst *, 4> candidates;
+    for (auto &I : F.getEntryBlock()) {
+      auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
+      if (!AI || AI->isArrayAllocation()) continue;
+      auto *arr_ty = llvm::dyn_cast<llvm::ArrayType>(
+          AI->getAllocatedType());
+      if (!arr_ty) continue;
+      if (arr_ty->getElementType() != i8_ty) continue;
+      if (arr_ty->getNumElements() < kSizeThreshold) continue;
+      candidates.push_back(AI);
+    }
+
+    for (auto *alloca : candidates) {
+      struct GEPInfo {
+        llvm::GetElementPtrInst *gep;
+        int64_t offset;
+      };
+      llvm::SmallVector<GEPInfo, 32> gep_infos;
+      llvm::SmallVector<llvm::MemSetInst *, 2> memsets;
+      bool has_opaque_use = false;
+
+      for (auto *user : alloca->users()) {
+        if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(user)) {
+          llvm::APInt ap_offset(64, 0);
+          if (GEP->accumulateConstantOffset(DL, ap_offset)) {
+            gep_infos.push_back({GEP, ap_offset.getSExtValue()});
+          } else {
+            has_opaque_use = true;
+          }
+        } else if (auto *MS = llvm::dyn_cast<llvm::MemSetInst>(user)) {
+          memsets.push_back(MS);
+        } else if (llvm::isa<llvm::PtrToIntInst>(user) ||
+                   llvm::isa<llvm::BitCastInst>(user)) {
+          has_opaque_use = true;
+        } else {
+          has_opaque_use = true;
+        }
+      }
+
+      if (gep_infos.empty())
+        continue;
+
+      // Group offsets into contiguous regions.
+      llvm::SmallVector<int64_t, 32> offsets;
+      for (auto &gi : gep_infos)
+        offsets.push_back(gi.offset);
+      llvm::sort(offsets);
+      offsets.erase(std::unique(offsets.begin(), offsets.end()),
+                    offsets.end());
+
+      struct Region { int64_t min_off, max_off; };
+      llvm::SmallVector<Region, 8> regions;
+      {
+        int64_t cur_min = offsets[0], cur_max = offsets[0];
+        for (size_t i = 1; i < offsets.size(); ++i) {
+          if (offsets[i] - cur_max > kGapTolerance) {
+            regions.push_back({cur_min, cur_max});
+            cur_min = offsets[i];
+          }
+          cur_max = offsets[i];
+        }
+        regions.push_back({cur_min, cur_max});
+      }
+
+      // Create per-region allocas.
+      llvm::IRBuilder<> EntryBuilder(&F.getEntryBlock().front());
+      struct RegionAlloca { int64_t min_off, max_off; llvm::AllocaInst *ai; };
+      llvm::SmallVector<RegionAlloca, 8> region_allocas;
+      for (auto &r : regions) {
+        int64_t size = r.max_off - r.min_off + kRegionPadding;
+        if (size <= 0) size = kRegionPadding;
+        auto *ty = llvm::ArrayType::get(i8_ty, size);
+        auto *ra = EntryBuilder.CreateAlloca(ty, nullptr, "split_region");
+        region_allocas.push_back({r.min_off, r.max_off, ra});
+      }
+
+      // Rewrite GEPs.
+      for (auto &gi : gep_infos) {
+        for (auto &ra : region_allocas) {
+          if (gi.offset >= ra.min_off && gi.offset <= ra.max_off) {
+            llvm::IRBuilder<> Builder(gi.gep);
+            auto *new_idx = llvm::ConstantInt::get(
+                Builder.getInt64Ty(), gi.offset - ra.min_off);
+            auto *new_gep = Builder.CreateGEP(
+                i8_ty, ra.ai, new_idx, "split_ptr");
+            gi.gep->replaceAllUsesWith(new_gep);
+            gi.gep->eraseFromParent();
+            changed = true;
+            break;
+          }
+        }
+      }
+
+      // Initialize per-region allocas from original memsets.
+      for (auto *MS : memsets) {
+        auto *val = MS->getValue();
+        bool is_volatile = MS->isVolatile();
+        for (auto &ra : region_allocas) {
+          int64_t size = ra.max_off - ra.min_off + kRegionPadding;
+          llvm::IRBuilder<> Builder(MS);
+          Builder.CreateMemSet(ra.ai, val, Builder.getInt64(size),
+                                llvm::MaybeAlign(), is_volatile);
+        }
+        if (!has_opaque_use) {
+          MS->eraseFromParent();
+          changed = true;
+        }
+      }
+
+      if (alloca->use_empty())
+        alloca->eraseFromParent();
+    }
+
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
+  }
+  static bool isRequired() { return true; }
+};
+
 bool hasControlTransferLikeCalls(const llvm::Function &F) {
   for (const auto &BB : F) {
     for (const auto &I : BB) {
@@ -1539,151 +1676,6 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // GEPs.  We collect constant-offset GEPs, group into contiguous regions,
     // create per-region allocas, and rewrite.
     if (!envDisabled("OMILL_SKIP_SPLIT_LARGE_ALLOCA")) {
-      struct SplitLargeAllocaPass
-          : llvm::PassInfoMixin<SplitLargeAllocaPass> {
-        llvm::PreservedAnalyses run(llvm::Function &F,
-                                     llvm::FunctionAnalysisManager &) {
-          if (F.isDeclaration())
-            return llvm::PreservedAnalyses::all();
-
-          static constexpr uint64_t kSizeThreshold = 4096;
-          static constexpr int64_t kGapTolerance = 16;
-          // Extra bytes beyond max observed offset per region to ensure
-          // accesses at the highest offset don't read out of bounds.
-          static constexpr int64_t kRegionPadding = 8;
-
-          auto &DL = F.getDataLayout();
-          auto *i8_ty = llvm::Type::getInt8Ty(F.getContext());
-          bool changed = false;
-
-          // Collect candidate allocas from the entry block.
-          llvm::SmallVector<llvm::AllocaInst *, 4> candidates;
-          for (auto &I : F.getEntryBlock()) {
-            auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
-            if (!AI || AI->isArrayAllocation()) continue;
-            auto *arr_ty = llvm::dyn_cast<llvm::ArrayType>(
-                AI->getAllocatedType());
-            if (!arr_ty) continue;
-            if (arr_ty->getElementType() != i8_ty) continue;
-            if (arr_ty->getNumElements() < kSizeThreshold) continue;
-            candidates.push_back(AI);
-          }
-
-          for (auto *alloca : candidates) {
-            // Collect constant-offset GEPs into this alloca.
-            struct GEPInfo {
-              llvm::GetElementPtrInst *gep;
-              int64_t offset;
-            };
-            llvm::SmallVector<GEPInfo, 32> gep_infos;
-            llvm::SmallVector<llvm::MemSetInst *, 2> memsets;
-            bool has_non_gep_non_memset_use = false;
-
-            for (auto *user : alloca->users()) {
-              if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(user)) {
-                llvm::APInt ap_offset(64, 0);
-                if (GEP->accumulateConstantOffset(DL, ap_offset)) {
-                  gep_infos.push_back({GEP, ap_offset.getSExtValue()});
-                } else {
-                  has_non_gep_non_memset_use = true;
-                }
-              } else if (auto *MS = llvm::dyn_cast<llvm::MemSetInst>(user)) {
-                memsets.push_back(MS);
-              } else {
-                has_non_gep_non_memset_use = true;
-              }
-            }
-
-            if (gep_infos.empty() || has_non_gep_non_memset_use)
-              continue;
-
-            // Group offsets into contiguous regions.
-            llvm::SmallVector<int64_t, 32> offsets;
-            for (auto &gi : gep_infos)
-              offsets.push_back(gi.offset);
-            llvm::sort(offsets);
-            offsets.erase(std::unique(offsets.begin(), offsets.end()),
-                          offsets.end());
-
-            struct Region {
-              int64_t min_off, max_off;
-            };
-            llvm::SmallVector<Region, 8> regions;
-            {
-              int64_t cur_min = offsets[0], cur_max = offsets[0];
-              for (size_t i = 1; i < offsets.size(); ++i) {
-                if (offsets[i] - cur_max > kGapTolerance) {
-                  regions.push_back({cur_min, cur_max});
-                  cur_min = offsets[i];
-                }
-                cur_max = offsets[i];
-              }
-              regions.push_back({cur_min, cur_max});
-            }
-
-            // Create per-region allocas.
-            llvm::IRBuilder<> EntryBuilder(
-                &F.getEntryBlock().front());
-            struct RegionAlloca {
-              int64_t min_off, max_off;
-              llvm::AllocaInst *ai;
-            };
-            llvm::SmallVector<RegionAlloca, 8> region_allocas;
-            for (auto &r : regions) {
-              int64_t size = r.max_off - r.min_off + kRegionPadding;
-              if (size <= 0) size = kRegionPadding;
-              auto *ty = llvm::ArrayType::get(i8_ty, size);
-              auto *ra = EntryBuilder.CreateAlloca(ty, nullptr,
-                                                    "split_region");
-              region_allocas.push_back({r.min_off, r.max_off, ra});
-            }
-
-            // Rewrite GEPs.
-            for (auto &gi : gep_infos) {
-              for (auto &ra : region_allocas) {
-                if (gi.offset >= ra.min_off &&
-                    gi.offset <= ra.max_off) {
-                  llvm::IRBuilder<> Builder(gi.gep);
-                  auto *new_idx = llvm::ConstantInt::get(
-                      Builder.getInt64Ty(), gi.offset - ra.min_off);
-                  auto *new_gep = Builder.CreateGEP(
-                      i8_ty, ra.ai, new_idx, "split_ptr");
-                  gi.gep->replaceAllUsesWith(new_gep);
-                  gi.gep->eraseFromParent();
-                  changed = true;
-                  break;
-                }
-              }
-            }
-
-            // Rewrite memsets: create per-region memsets.
-            for (auto *MS : memsets) {
-              auto *val = MS->getValue();
-              bool is_volatile = MS->isVolatile();
-              for (auto &ra : region_allocas) {
-                int64_t size = ra.max_off - ra.min_off + kRegionPadding;
-                llvm::IRBuilder<> Builder(MS);
-                auto *region_ptr = Builder.CreateGEP(
-                    i8_ty, ra.ai,
-                    llvm::ConstantInt::get(Builder.getInt64Ty(), 0));
-                Builder.CreateMemSet(region_ptr, val,
-                                      Builder.getInt64(size),
-                                      llvm::MaybeAlign(), is_volatile);
-              }
-              MS->eraseFromParent();
-              changed = true;
-            }
-
-            // If the original alloca is now dead, erase it.
-            if (alloca->use_empty())
-              alloca->eraseFromParent();
-          }
-
-          return changed ? llvm::PreservedAnalyses::none()
-                         : llvm::PreservedAnalyses::all();
-        }
-        static bool isRequired() { return true; }
-      };
       llvm::FunctionPassManager FPM;
       FPM.addPass(SplitLargeAllocaPass{});
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
@@ -1927,6 +1919,47 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
     }
     MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+  // Internalize _native functions whose body is just `entry: unreachable`.
+  // These are ABI wrappers for unreachable VM handler targets.  Making them
+  // internal lets GlobalDCE remove them and their callers' dead code paths.
+  if (!envDisabled("OMILL_SKIP_DEAD_NATIVE_INTERN")) {
+    struct InternalizeDeadNativesPass
+        : llvm::PassInfoMixin<InternalizeDeadNativesPass> {
+      llvm::PreservedAnalyses run(llvm::Module &M,
+                                   llvm::ModuleAnalysisManager &) {
+        bool changed = false;
+        for (auto &F : M) {
+          if (F.isDeclaration()) continue;
+          if (!F.getName().ends_with("_native")) continue;
+          if (F.size() != 1) continue;
+          auto &entry = F.getEntryBlock();
+          if (entry.size() != 1) continue;
+          if (!llvm::isa<llvm::UnreachableInst>(entry.front())) continue;
+          F.setLinkage(llvm::GlobalValue::InternalLinkage);
+          changed = true;
+        }
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+    MPM.addPass(InternalizeDeadNativesPass{});
+    MPM.addPass(llvm::GlobalDCEPass());
+  }
+
+  // Split large native_stack allocas and promote to SSA.
+  // After ABI recovery, each _native function has a [69632 x i8] alloca
+  // with hundreds of constant-offset GEP accesses (stack spills).
+  // Splitting into per-region allocas enables SROA.
+  if (!envDisabled("OMILL_SKIP_SPLIT_LARGE_ALLOCA")) {
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(SplitLargeAllocaPass{});
+    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::ADCEPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
   // Replace sentinel data constants (0xCCCCCCCCCCCCCCCC from stack fill)
