@@ -2883,7 +2883,240 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
-  // Cleanup after sentinel elimination + concretization.
+  // VmContext dead store elimination.
+  // After ConcretizeAllocaPtrsPass resolves alloca-derived inttoptr→GEP,
+  // any remaining inttoptr users access external memory (driver structs,
+  // kernel data, VM dispatch tables) and do NOT alias the alloca.
+  // Standard DSE is blocked by the ptrtoint escape; this pass performs
+  // byte-level liveness tracking on single-BB functions to find stores
+  // that are overwritten before read or never read at all.
+  if (!envDisabled("OMILL_SKIP_VMCONTEXT_DSE")) {
+    struct VmContextDSEPass : llvm::PassInfoMixin<VmContextDSEPass> {
+      /// Get the alloca and byte offset from a pointer (strips GEPs).
+      static std::pair<llvm::AllocaInst *, int64_t>
+      getAllocaAndOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
+        int64_t offset = 0;
+        while (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr)) {
+          llvm::APInt gep_off(64, 0);
+          if (!gep->accumulateConstantOffset(DL, gep_off))
+            return {nullptr, 0};
+          offset += gep_off.getSExtValue();
+          ptr = gep->getPointerOperand();
+        }
+        return {llvm::dyn_cast<llvm::AllocaInst>(ptr), offset};
+      }
+
+      /// Find large alloca with ptrtoint user — the vmcontext candidate.
+      static llvm::AllocaInst *findVmContextAlloca(llvm::Function &F) {
+        for (auto &I : F.getEntryBlock()) {
+          auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
+          if (!AI)
+            continue;
+          auto *arrTy = llvm::dyn_cast<llvm::ArrayType>(AI->getAllocatedType());
+          if (!arrTy)
+            continue;
+          uint64_t sz = arrTy->getNumElements() *
+                        F.getDataLayout().getTypeAllocSize(
+                            arrTy->getElementType());
+          if (sz < 256)
+            continue;
+          // Must have at least one ptrtoint user (the escape).
+          bool has_pti = false;
+          for (auto *U : AI->users()) {
+            if (llvm::isa<llvm::PtrToIntInst>(U)) {
+              has_pti = true;
+              break;
+            }
+            // ptrtoint may be on a GEP of the alloca.
+            if (auto *G = llvm::dyn_cast<llvm::GetElementPtrInst>(U)) {
+              for (auto *GU : G->users()) {
+                if (llvm::isa<llvm::PtrToIntInst>(GU)) {
+                  has_pti = true;
+                  break;
+                }
+              }
+              if (has_pti)
+                break;
+            }
+          }
+          if (has_pti)
+            return AI;
+        }
+        return nullptr;
+      }
+
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration() || F.empty())
+          return llvm::PreservedAnalyses::all();
+        auto *AI = findVmContextAlloca(F);
+        if (!AI)
+          return llvm::PreservedAnalyses::all();
+
+        auto &DL = F.getDataLayout();
+        auto *arrTy = llvm::cast<llvm::ArrayType>(AI->getAllocatedType());
+        uint64_t alloca_sz = arrTy->getNumElements() *
+                             DL.getTypeAllocSize(arrTy->getElementType());
+
+        // Byte-level tracking: pending[byte] = last StoreInst that wrote it.
+        // A store is "live" if any byte it covers is loaded before being
+        // overwritten by another store.
+        std::vector<llvm::StoreInst *> pending(alloca_sz, nullptr);
+        llvm::DenseSet<llvm::StoreInst *> live_stores;
+
+        auto &entry = F.getEntryBlock();
+        for (auto &I : entry) {
+          if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+            auto [base, off] = getAllocaAndOffset(LI->getPointerOperand(), DL);
+            if (base != AI || off < 0)
+              continue;
+            uint64_t sz = DL.getTypeStoreSize(LI->getType());
+            uint64_t uoff = static_cast<uint64_t>(off);
+            for (uint64_t b = uoff; b < uoff + sz && b < alloca_sz; ++b) {
+              if (pending[b])
+                live_stores.insert(pending[b]);
+            }
+            continue;
+          }
+
+          if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+            auto [base, off] =
+                getAllocaAndOffset(SI->getPointerOperand(), DL);
+            if (base != AI || off < 0)
+              continue;
+            uint64_t sz = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+            uint64_t uoff = static_cast<uint64_t>(off);
+            for (uint64_t b = uoff; b < uoff + sz && b < alloca_sz; ++b)
+              pending[b] = SI;
+            continue;
+          }
+
+          // memset to the alloca: treat as a store to every byte.
+          if (auto *MS = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
+            auto [base, off] = getAllocaAndOffset(MS->getDest(), DL);
+            if (base != AI || off < 0)
+              continue;
+            auto *len = llvm::dyn_cast<llvm::ConstantInt>(MS->getLength());
+            if (!len)
+              continue;
+            uint64_t uoff = static_cast<uint64_t>(off);
+            uint64_t end = uoff + len->getZExtValue();
+            for (uint64_t b = uoff; b < end && b < alloca_sz; ++b)
+              pending[b] = nullptr; // memset is not a StoreInst; clear pending
+            continue;
+          }
+
+          // Calls that take a pointer to the alloca: conservatively mark
+          // all pending bytes as live (the callee may read them).
+          if (auto *CI = llvm::dyn_cast<llvm::CallBase>(&I)) {
+            // Skip llvm.memset/memcpy intrinsics — already handled above
+            // or known not to read the alloca.
+            if (CI->getIntrinsicID() == llvm::Intrinsic::memset ||
+                CI->getIntrinsicID() == llvm::Intrinsic::memcpy ||
+                CI->getIntrinsicID() == llvm::Intrinsic::memmove)
+              continue;
+            // Check if any arg points into the alloca.
+            bool touches_alloca = false;
+            for (auto &arg : CI->args()) {
+              if (!arg->getType()->isPointerTy())
+                continue;
+              auto [base, off] = getAllocaAndOffset(arg.get(), DL);
+              if (base == AI) {
+                touches_alloca = true;
+                break;
+              }
+            }
+            if (touches_alloca) {
+              for (uint64_t b = 0; b < alloca_sz; ++b) {
+                if (pending[b])
+                  live_stores.insert(pending[b]);
+              }
+            }
+          }
+        }
+
+        // For multi-BB functions: stores still in pending[] at end of entry
+        // are visible to successor blocks.  Scan all non-entry BBs for loads
+        // from the alloca; if any loads an offset whose pending store is set,
+        // mark that store as live.
+        if (F.size() > 1) {
+          // Collect byte offsets that have a non-null pending store.
+          llvm::DenseSet<uint64_t> pending_offsets;
+          for (uint64_t b = 0; b < alloca_sz; ++b) {
+            if (pending[b])
+              pending_offsets.insert(b);
+          }
+          if (!pending_offsets.empty()) {
+            for (auto &BB : F) {
+              if (&BB == &entry)
+                continue;
+              for (auto &I : BB) {
+                if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+                  auto [base, off] =
+                      getAllocaAndOffset(LI->getPointerOperand(), DL);
+                  if (base != AI || off < 0)
+                    continue;
+                  uint64_t sz = DL.getTypeStoreSize(LI->getType());
+                  uint64_t uoff = static_cast<uint64_t>(off);
+                  for (uint64_t b = uoff; b < uoff + sz && b < alloca_sz; ++b) {
+                    if (pending[b])
+                      live_stores.insert(pending[b]);
+                  }
+                }
+                // Calls in non-entry BBs that take the alloca pointer:
+                // conservatively mark all pending stores as live.
+                if (auto *CI = llvm::dyn_cast<llvm::CallBase>(&I)) {
+                  if (CI->getIntrinsicID() == llvm::Intrinsic::memset ||
+                      CI->getIntrinsicID() == llvm::Intrinsic::memcpy ||
+                      CI->getIntrinsicID() == llvm::Intrinsic::memmove)
+                    continue;
+                  for (auto &arg : CI->args()) {
+                    if (!arg->getType()->isPointerTy())
+                      continue;
+                    auto [base, off] = getAllocaAndOffset(arg.get(), DL);
+                    if (base == AI) {
+                      for (uint64_t b = 0; b < alloca_sz; ++b) {
+                        if (pending[b])
+                          live_stores.insert(pending[b]);
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // Collect dead stores: any StoreInst to the alloca that isn't live.
+        llvm::SmallVector<llvm::StoreInst *, 32> dead;
+        for (auto &I : entry) {
+          auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I);
+          if (!SI)
+            continue;
+          auto [base, off] = getAllocaAndOffset(SI->getPointerOperand(), DL);
+          if (base != AI || off < 0)
+            continue;
+          if (!live_stores.contains(SI))
+            dead.push_back(SI);
+        }
+
+        for (auto *SI : dead)
+          SI->eraseFromParent();
+
+        return dead.empty() ? llvm::PreservedAnalyses::all()
+                            : llvm::PreservedAnalyses::none();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(VmContextDSEPass{});
+    FPM.addPass(llvm::InstCombinePass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
+  // Cleanup after sentinel elimination + concretization + vmcontext DSE.
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
