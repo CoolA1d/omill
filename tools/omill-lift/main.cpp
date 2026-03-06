@@ -49,6 +49,7 @@
 #include "omill/Analysis/CallGraphAnalysis.h"
 #include "omill/Analysis/ExceptionInfo.h"
 #include "omill/Analysis/LiftedFunctionMap.h"
+#include "omill/Analysis/VMHandlerChainSolver.h"
 #include "omill/Analysis/VMHandlerGraph.h"
 #include "omill/Omill.h"
 #include "omill/Tools/LiftRunContract.h"
@@ -1336,24 +1337,49 @@ int main(int argc, char **argv) {
   errs() << "Lifting complete\n";
   events.emitInfo("lifting_completed", "lifting complete");
 
-  // VM mode: build handler graph and bulk-lift all discovered handlers.
+  // VM mode: use chain solver to discover handlers reachable from the entry
+  // wrapper, then lift only those.  No byte-pattern bulk scan — further
+  // targets are discovered naturally by the pipeline's iterative resolution.
   std::shared_ptr<omill::VMHandlerGraph> vm_graph;
   if (vm_mode && !RawBinary) {
+    // Start with metadata-only graph — no byte-pattern scanning.
     vm_graph = std::make_shared<omill::VMHandlerGraph>(
-        pe.memory_map, pe.image_base, vm_entry_va, vm_exit_va);
-    events.emitInfo("vm_graph_built", "vm handler graph created",
-                    {{"handlers", static_cast<int64_t>(vm_graph->handlerEntries().size())},
-                     {"dispatch_sites", static_cast<int64_t>(vm_graph->numDispatchSites())}});
+        pe.image_base, vm_entry_va, vm_exit_va);
 
-    errs() << "VM handler graph: " << vm_graph->handlerEntries().size()
-           << " handlers, " << vm_graph->numDispatchSites()
-           << " dispatch sites\n";
+    // Run chain solver to discover handler chains via concrete emulation.
+    std::vector<uint64_t> chain_handler_vas;
+    {
+      omill::VMHandlerChainSolver solver(pe.memory_map, pe.image_base,
+                                         vm_entry_va, vm_exit_va);
 
-    // Lift all discovered handler entry VAs.
+      // Set the handler segment range (seg006 bounds).
+      uint64_t seg_start = vm_entry_va;
+      uint64_t seg_end = vm_entry_va + 0x2000000;
+      pe.memory_map.forEachRegion(
+          [&](uint64_t base, const uint8_t *, size_t size) {
+            if (vm_entry_va >= base && vm_entry_va < base + size) {
+              seg_start = base;
+              seg_end = base + size;
+            }
+          });
+      solver.setHandlerSegmentRange(seg_start, seg_end);
+
+      // Solve from the entry wrapper.
+      auto chain = solver.solveFromWrapper(func_va);
+      if (!chain.empty()) {
+        vm_graph->mergeChainResults(solver);
+        events.emitInfo("vm_chain_solved", "vm handler chain solved",
+                        {{"handlers", static_cast<int64_t>(chain.size())}});
+        for (auto &entry : chain)
+          chain_handler_vas.push_back(entry.handler_va);
+      }
+    }
+
+    // Lift only chain-solved handlers.
     unsigned lifted_count = 0;
     unsigned failed_count = 0;
     unsigned skipped_count = 0;
-    for (uint64_t handler_va : vm_graph->handlerEntries()) {
+    for (uint64_t handler_va : chain_handler_vas) {
       // Skip if already lifted (e.g. func_va or vmenter/vmexit).
       std::string name = "sub_" + Twine::utohexstr(handler_va).str();
       if (auto *existing = module->getFunction(name)) {

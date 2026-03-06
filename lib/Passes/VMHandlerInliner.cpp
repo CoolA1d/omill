@@ -186,9 +186,11 @@ llvm::SmallVector<llvm::Function *, 16> identifyHandlers(
     if (size > max_instrs)
       continue;
 
-    // Skip functions that themselves are lifted (sub_*) — those are
-    // real functions, not VM handlers.
-    if (isLiftedFunction(*func))
+    // Skip functions that are lifted (sub_*) — those are real functions,
+    // not VM handlers — UNLESS they're explicitly tagged as vm_handler
+    // by the chain solver (in which case they ARE handler bodies to inline).
+    if (isLiftedFunction(*func) &&
+        !func->hasFnAttribute("omill.vm_handler"))
       continue;
 
     handlers.push_back(func);

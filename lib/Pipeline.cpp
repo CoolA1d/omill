@@ -1550,6 +1550,10 @@ void buildPipeline(llvm::ModulePassManager &MPM, const PipelineOptions &opts) {
     // Lower resolved dispatch targets to direct calls.
     {
       llvm::FunctionPassManager FPM;
+      // Convert dispatch_jump/dispatch_call with constant targets to
+      // direct calls/branches (required for VMHandlerInlinerPass below).
+      FPM.addPass(
+          ResolveAndLowerControlFlowPass(ResolvePhases::ResolveTargets));
       FPM.addPass(
           LowerRemillIntrinsicsPass(LowerCategories::ResolvedDispatch));
       MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
