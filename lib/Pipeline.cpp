@@ -13,6 +13,7 @@
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/DCE.h>
 #include <llvm/Transforms/Scalar/EarlyCSE.h>
@@ -2883,6 +2884,247 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
   }
 
+  // VmContext slot forwarding: replace loads from the vmcontext alloca
+  // with the SSA value that was last stored to the same byte range.
+  // This is a lightweight store-to-load forwarding pass that handles the
+  // case where SROA can't decompose the alloca (ptrtoint escape) and GVN
+  // can't see through it (the alloca is opaque to alias analysis).
+  // Must run after ConcretizeAllocaPtrsPass (which resolves all alloca-
+  // derived inttoptr→GEP, giving us clean GEP-based accesses).
+  if (!envDisabled("OMILL_SKIP_VMCONTEXT_SLOT_FWD")) {
+    struct VmContextSlotForwardingPass
+        : llvm::PassInfoMixin<VmContextSlotForwardingPass> {
+      static std::pair<llvm::AllocaInst *, int64_t>
+      getAllocaAndOffset(llvm::Value *ptr, const llvm::DataLayout &DL) {
+        int64_t offset = 0;
+        while (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(ptr)) {
+          llvm::APInt gep_off(64, 0);
+          if (!gep->accumulateConstantOffset(DL, gep_off))
+            return {nullptr, 0};
+          offset += gep_off.getSExtValue();
+          ptr = gep->getPointerOperand();
+        }
+        return {llvm::dyn_cast<llvm::AllocaInst>(ptr), offset};
+      }
+
+      static llvm::AllocaInst *findVmContextAlloca(llvm::Function &F) {
+        for (auto &I : F.getEntryBlock()) {
+          auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I);
+          if (!AI)
+            continue;
+          auto *arrTy =
+              llvm::dyn_cast<llvm::ArrayType>(AI->getAllocatedType());
+          if (!arrTy)
+            continue;
+          uint64_t sz = arrTy->getNumElements() *
+                        F.getDataLayout().getTypeAllocSize(
+                            arrTy->getElementType());
+          if (sz < 256)
+            continue;
+          bool has_pti = false;
+          for (auto *U : AI->users()) {
+            if (llvm::isa<llvm::PtrToIntInst>(U)) {
+              has_pti = true;
+              break;
+            }
+            if (auto *G = llvm::dyn_cast<llvm::GetElementPtrInst>(U)) {
+              for (auto *GU : G->users()) {
+                if (llvm::isa<llvm::PtrToIntInst>(GU)) {
+                  has_pti = true;
+                  break;
+                }
+              }
+              if (has_pti)
+                break;
+            }
+          }
+          if (has_pti)
+            return AI;
+        }
+        return nullptr;
+      }
+
+      llvm::PreservedAnalyses run(llvm::Function &F,
+                                   llvm::FunctionAnalysisManager &) {
+        if (F.isDeclaration() || F.empty())
+          return llvm::PreservedAnalyses::all();
+
+        auto *AI = findVmContextAlloca(F);
+        if (!AI)
+          return llvm::PreservedAnalyses::all();
+
+        auto &DL = F.getDataLayout();
+        auto *arrTy = llvm::cast<llvm::ArrayType>(AI->getAllocatedType());
+        uint64_t alloca_sz = arrTy->getNumElements() *
+                             DL.getTypeAllocSize(arrTy->getElementType());
+
+        // Track last stored value per byte range.
+        // Key: {offset, store_size} → {stored_value, store_inst}
+        // We use a flat array indexed by byte offset; each entry tracks
+        // the store that last wrote it.
+        struct SlotInfo {
+          llvm::Value *val = nullptr;
+          llvm::StoreInst *store = nullptr;
+          int64_t slot_offset = -1; // offset of the store that wrote this byte
+          uint64_t slot_size = 0;   // size of the store that wrote this byte
+        };
+        std::vector<SlotInfo> slots(alloca_sz);
+
+        bool changed = false;
+        llvm::SmallVector<llvm::Instruction *, 32> dead;
+
+        // Process each basic block independently.
+        for (auto &BB : F) {
+          // Reset slot tracking at BB boundaries for soundness.
+          // (Only entry-block stores are guaranteed to dominate all uses.)
+          // For non-entry blocks, we still do intra-block forwarding.
+          std::fill(slots.begin(), slots.end(), SlotInfo{});
+
+          // If this is the entry block, initialize slots from memset(0).
+          if (&BB == &F.getEntryBlock()) {
+            for (auto &I : BB) {
+              auto *MS = llvm::dyn_cast<llvm::MemSetInst>(&I);
+              if (!MS)
+                continue;
+              auto [base, off] = getAllocaAndOffset(MS->getDest(), DL);
+              if (base != AI || off < 0)
+                continue;
+              auto *fill = llvm::dyn_cast<llvm::ConstantInt>(MS->getValue());
+              auto *len = llvm::dyn_cast<llvm::ConstantInt>(MS->getLength());
+              if (!fill || !len)
+                continue;
+              if (fill->getZExtValue() != 0)
+                continue;
+              // Mark these bytes as storing zero. We don't track a specific
+              // store inst for memset — individual byte loads will need to
+              // construct the zero constant.
+              uint64_t uoff = static_cast<uint64_t>(off);
+              uint64_t end = uoff + len->getZExtValue();
+              for (uint64_t b = uoff; b < end && b < alloca_sz; ++b) {
+                // Mark with null store but set val to indicate "known zero"
+                // We'll handle this specially when forwarding loads.
+              }
+              break; // Only one memset expected.
+            }
+          }
+
+          for (auto &I : BB) {
+            if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+              auto [base, off] =
+                  getAllocaAndOffset(SI->getPointerOperand(), DL);
+              if (base != AI || off < 0)
+                continue;
+              uint64_t sz =
+                  DL.getTypeStoreSize(SI->getValueOperand()->getType());
+              uint64_t uoff = static_cast<uint64_t>(off);
+              if (uoff + sz > alloca_sz)
+                continue;
+              // Record this store for every byte it covers.
+              for (uint64_t b = uoff; b < uoff + sz; ++b) {
+                slots[b] = {SI->getValueOperand(), SI, off, sz};
+              }
+              continue;
+            }
+
+            if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+              auto [base, off] =
+                  getAllocaAndOffset(LI->getPointerOperand(), DL);
+              if (base != AI || off < 0)
+                continue;
+              uint64_t sz = DL.getTypeStoreSize(LI->getType());
+              uint64_t uoff = static_cast<uint64_t>(off);
+              if (uoff + sz > alloca_sz)
+                continue;
+
+              // Check if all bytes of this load are covered by a single
+              // store at the exact same offset and size.
+              auto &first = slots[uoff];
+              if (!first.val || !first.store)
+                continue;
+              if (first.slot_offset != off ||
+                  first.slot_size != sz)
+                continue;
+              // Verify all bytes point to the same store.
+              bool uniform = true;
+              for (uint64_t b = uoff + 1; b < uoff + sz; ++b) {
+                if (slots[b].store != first.store) {
+                  uniform = false;
+                  break;
+                }
+              }
+              if (!uniform)
+                continue;
+
+              // Forward the stored value to the load.
+              llvm::Value *fwd = first.val;
+              if (fwd->getType() != LI->getType()) {
+                // Type mismatch but same size — insert bitcast.
+                if (DL.getTypeStoreSize(fwd->getType()) !=
+                    DL.getTypeStoreSize(LI->getType()))
+                  continue;
+                llvm::IRBuilder<> builder(LI);
+                fwd = builder.CreateBitCast(fwd, LI->getType());
+              }
+              LI->replaceAllUsesWith(fwd);
+              dead.push_back(LI);
+              changed = true;
+              continue;
+            }
+
+            // memset to the alloca: clear slot tracking for those bytes.
+            if (auto *MS = llvm::dyn_cast<llvm::MemSetInst>(&I)) {
+              auto [base, off] = getAllocaAndOffset(MS->getDest(), DL);
+              if (base != AI || off < 0)
+                continue;
+              auto *len = llvm::dyn_cast<llvm::ConstantInt>(MS->getLength());
+              if (!len)
+                continue;
+              uint64_t uoff = static_cast<uint64_t>(off);
+              uint64_t end = uoff + len->getZExtValue();
+              for (uint64_t b = uoff; b < end && b < alloca_sz; ++b)
+                slots[b] = {};
+              continue;
+            }
+
+            // Calls that might write to the alloca: clear all tracking.
+            if (auto *CI = llvm::dyn_cast<llvm::CallBase>(&I)) {
+              if (CI->getIntrinsicID() == llvm::Intrinsic::memset ||
+                  CI->getIntrinsicID() == llvm::Intrinsic::memcpy ||
+                  CI->getIntrinsicID() == llvm::Intrinsic::memmove)
+                continue;
+              for (auto &arg : CI->args()) {
+                if (!arg->getType()->isPointerTy())
+                  continue;
+                auto [base, off] = getAllocaAndOffset(arg.get(), DL);
+                if (base == AI) {
+                  std::fill(slots.begin(), slots.end(), SlotInfo{});
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        for (auto *I : dead)
+          I->eraseFromParent();
+
+        return changed ? llvm::PreservedAnalyses::none()
+                       : llvm::PreservedAnalyses::all();
+      }
+      static bool isRequired() { return true; }
+    };
+
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(VmContextSlotForwardingPass{});
+    // Re-run ConcretizeAllocaPtrsPass: slot forwarding exposes new
+    // ptrtoint-derived inttoptr chains (loaded ptrtoint values that
+    // were previously hidden behind store-load round-trips).
+    FPM.addPass(ConcretizeAllocaPtrsPass{});
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+  }
+
   // VmContext dead store elimination.
   // After ConcretizeAllocaPtrsPass resolves alloca-derived inttoptr→GEP,
   // any remaining inttoptr users access external memory (driver structs,
@@ -3120,7 +3362,9 @@ void buildLateCleanupPipeline(llvm::ModulePassManager &MPM) {
   {
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(llvm::AggressiveInstCombinePass());
     FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::GVNPass());
     FPM.addPass(llvm::SimplifyCFGPass());
     FPM.addPass(llvm::ADCEPass());
     FPM.addPass(llvm::DSEPass());
